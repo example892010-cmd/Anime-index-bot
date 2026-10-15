@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: aniflix-anime-finder-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: aniflix-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DATABASE_PATH
+        value: /data/aniflix.db
+      - key: BOT_NAME
+        value: ANIFLIX NETWORK TAMIL
+      - key: LOG_LEVEL
+        value: INFO
+      - key: TIMEZONE
+        value: Asia/Kolkata
