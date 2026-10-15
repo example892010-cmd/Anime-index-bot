@@ -12,8 +12,11 @@ async def main() -> None:
     settings=load_config()
     logging.basicConfig(level=getattr(logging,settings.log_level,logging.INFO),format="%(asctime)s %(levelname)s %(name)s %(message)s")
     db=await Database(settings.database_path).connect()
+    # Seed environment defaults only when the database has no value yet.
+    # Owner-edited runtime settings must survive restarts.
     for key, value in (("start_image", settings.start_image), ("updates_channel", settings.updates_channel), ("bot_display_name", settings.bot_name)):
-        if value: await db.set_setting(key, value)
+        if value and not await db.get_setting(key, ""):
+            await db.set_setting(key, value)
     bot=Bot(settings.bot_token,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp=Dispatcher()
     for router in (start.router, admin_panel.router, user_management.router, force_sub.router, browse.router, search.router): dp.include_router(router)

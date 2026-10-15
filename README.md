@@ -73,7 +73,7 @@ The application fails fast if `OWNER_ID` is missing or non-numeric. `BOT_TOKEN` 
 - Send any ordinary text containing an anime title to search.
 - `/browse` lists up to 50 active titles.
 - `/admin` opens the protected inline panel.
-- `/users`, `/userstats`, and `/recentsearches` are protected and show tracked search activity only.
+- `/users` provides paginated searching-user records; `/userbyid`, `/userstats`, and `/recentsearches` are protected and show tracked search activity only.
 - `/cancel` clears the active admin FSM workflow.
 
 ### Add anime and links
@@ -86,7 +86,7 @@ The service layer validates and stores actual HTTP(S) links; it never fabricates
 /addlink ANIME_ID DISPLAY_TITLE URL
 ```
 
-The current handler set includes the validated `LinkService` and stored link buttons. Advanced guided edit/reorder/delete screens are not included in this MVP and are called out as limitations rather than pretending to be complete.
+The admin panel supports guided link creation, anime editing, confirmed anime deletion, alias addition, poster updates, and link listing. Additional owner/admin commands include `/links ANIME_ID`, `/addpost ANIME_ID LABEL URL`, `/deletelink LINK_ID`, `/disablelink LINK_ID`, and `/deletealias ALIAS_ID`. All links must be actual HTTP(S) URLs; the bot does not invent them.
 
 ### Force subscription
 
@@ -97,6 +97,9 @@ Force-subscription configuration is database-backed and applies to subsequent ch
 /forcesub_remove CHANNEL_ID
 /forcesub_on
 /forcesub_off
+/forcesub_enable CHANNEL_ID
+/forcesub_disable CHANNEL_ID
+/forcesub_invite CHANNEL_ID https://t.me/+INVITE
 /checkchannels
 ```
 
@@ -142,15 +145,17 @@ pytest -q
 
 The included tests use temporary SQLite files and do not require a live Telegram token or channels. They cover schema persistence, duplicate prevention, normalization, alias/exact/partial search, conservative no-match behavior, tracking, owner/admin permissions, force-sub persistence, URL validation, configuration parsing, and backup integrity.
 
-## Current MVP limitations
+## Remaining limitations and verification notes
 
-- The inline admin panel renders every requested category and protects callbacks. The Add Anime, welcome, start-image, statistics, admin, force-sub, and backup actions are functional. Detailed guided screens for poster/link/alias editing, link reorder/delete/enable, post management, search-user-by-ID, restore upload confirmation, and multi-page inline navigation are not implemented yet; those buttons return an explicit limitation message rather than claiming success.
-- `/addlink` is documented and should be wired into a guided admin workflow before broad production use; the underlying validated service and database table are implemented.
-- Search suggestions are conservative database partial matches, not an external fuzzy-search engine.
-- Telegram membership verification depends on real bot channel access and Telegram API responses; no live channel verification is claimed by local tests.
+- Force-subscription settings are changed through owner-only Telegram commands and the inline panel; all settings are stored in SQLite and apply immediately. Channel display names entered through `/forcesub_add` are currently a single token; use a short label or `@publicusername`.
+- Anime browsing currently displays up to 50 titles rather than paginating the catalog.
+- Link records can be added, listed, deleted, or disabled. Reordering links and a dedicated guided link-edit screen are not implemented.
+- Restore validates the SQLite integrity and expected schema, creates a safety backup, and requires the owner to upload the database document. Test restore on a non-production copy before relying on it.
+- Telegram membership checks depend on real bot channel access and Telegram API responses; local automated tests cannot prove access to live channels.
+- Search suggestions are conservative database matches, not an external fuzzy-search engine.
 - No mass messaging is implemented by design.
 
-No MongoDB, PostgreSQL, external search API, real token, or private link is included.
+No MongoDB, PostgreSQL, external search API, real token, or private invite link is included.
 
 ## License
 
