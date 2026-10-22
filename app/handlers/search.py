@@ -29,6 +29,9 @@ async def search(message: Message, db, bot):
     for row in rows[:5]:
         links=await db.links_for_anime(row["id"])
         text=f"✦ <b>{row['title']}</b>\n\n📺 Type: {row['anime_type']}\n🎙️ Audio: {row['audio_language'] or 'Not specified'}\n📦 Available links: {len(links)}"
+        if row["genres"]: text+=f"\n🏷️ Genre: {row['genres']}"
+        qualities=sorted({link["quality"] for link in links if link["quality"]})
+        if qualities: text+=f"\n🎞️ Quality: {', '.join(qualities)}"
         if row["description"]: text+=f"\n\n{row['description']}"
         buttons=[[InlineKeyboardButton(text=l["display_title"],url=l["url"])] for l in links]
         markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
