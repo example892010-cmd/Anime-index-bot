@@ -8,7 +8,7 @@ from app.database import Database
 from app.utils import normalize_title, valid_url
 
 CATALOGUE_SEEDED_SETTING = "catalogue_seeded_v1"
-REQUIRED_FIELDS = {"title", "link", "genre", "audio", "quality", "button_color"}
+REQUIRED_FIELDS = {"title", "link", "genre", "audio", "quality"}
 
 
 def load_catalogue(path: str | Path) -> list[dict[str, Any]]:
@@ -39,7 +39,7 @@ def load_catalogue(path: str | Path) -> list[dict[str, Any]]:
             raise ValueError(f"Invalid link for catalogue title: {title}")
         if not isinstance(qualities, list) or not all(isinstance(item, str) for item in qualities):
             raise ValueError(f"Quality must be a list of strings for: {title}")
-        key = (title, link, record["genre"], record["audio"], tuple(qualities), record["button_color"])
+        key = (title, link, record["genre"], record["audio"], tuple(qualities), record.get("button_color"))
         if key in seen:
             continue
         seen.add(key)
@@ -50,7 +50,9 @@ def load_catalogue(path: str | Path) -> list[dict[str, Any]]:
 async def seed_catalogue(db: Database, path: str | Path) -> int:
     """Import the initial JSON catalogue once, preserving existing DB records."""
     if await db.get_setting(CATALOGUE_SEEDED_SETTING, "0") == "1":
-        return 0
+        # Recover from an earlier deployment that marked an empty import complete.
+        if (await db.stats())["anime"] > 0:
+            return 0
 
     records = load_catalogue(path)
     imported = 0
