@@ -12,6 +12,8 @@
 
 `data/anime.json` is the initial catalogue source. On the first startup, missing records are inserted into the existing SQLite database and the `catalogue_seeded_v1` setting prevents duplicate re-imports. Existing database records are never deleted or reset. Configure `DATABASE_PATH` on a persistent Render disk or Railway volume so imported records and later admin changes survive redeployments.
 
+Startup now fails clearly if `data/anime.json` is missing, invalid JSON, or an empty array. The bot never replaces a missing or invalid catalogue with `[]` and never marks an empty catalogue as successfully imported.
+
 The supplied `button_color` values remain unchanged in the JSON file. Telegram inline buttons do not expose a custom color API, so the existing inline button implementation cannot render a literal green button; the catalogue link itself is preserved exactly.
 
 ## Upload and deploy

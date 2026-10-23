@@ -15,7 +15,14 @@ async def main() -> None:
     logging.basicConfig(level=getattr(logging,settings.log_level,logging.INFO),format="%(asctime)s %(levelname)s %(name)s %(message)s")
     db=await Database(settings.database_path).connect()
     catalogue_path=Path(__file__).resolve().parent / "data" / "anime.json"
-    if catalogue_path.exists(): await seed_catalogue(db, catalogue_path)
+    if not catalogue_path.is_file():
+        await db.close()
+        raise FileNotFoundError(f"Required catalogue file is missing: {catalogue_path}")
+    try:
+        await seed_catalogue(db, catalogue_path)
+    except Exception:
+        await db.close()
+        raise
     for key, value in (("start_image", settings.start_image), ("updates_channel", settings.updates_channel), ("bot_display_name", settings.bot_name)):
         if value: await db.set_setting(key, value)
     bot=Bot(settings.bot_token,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
