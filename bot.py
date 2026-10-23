@@ -19,7 +19,8 @@ async def main() -> None:
         await db.close()
         raise FileNotFoundError(f"Required catalogue file is missing: {catalogue_path}")
     try:
-        await seed_catalogue(db, catalogue_path)
+        imported = await seed_catalogue(db, catalogue_path)
+        logging.info("Anime catalogue ready: imported=%s saved=%s", imported, (await db.stats())["anime"])
     except Exception:
         await db.close()
         raise
