@@ -14,6 +14,8 @@
 
 Startup now fails clearly if `data/anime.json` is missing, invalid JSON, or an empty array. The bot never replaces a missing or invalid catalogue with `[]` and never marks an empty catalogue as successfully imported.
 
+The loader accepts both catalogue formats: records may include `button_color`, or may omit it as in the latest supplied list. Titles, genres, audio, qualities, and links remain required and are preserved. If an older deployment left the import marker set while the database has zero anime records, startup safely retries the import.
+
 The supplied `button_color` values remain unchanged in the JSON file. Telegram inline buttons do not expose a custom color API, so the existing inline button implementation cannot render a literal green button; the catalogue link itself is preserved exactly.
 
 ## Upload and deploy
