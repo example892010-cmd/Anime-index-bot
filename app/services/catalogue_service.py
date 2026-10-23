@@ -12,10 +12,18 @@ REQUIRED_FIELDS = {"title", "link", "genre", "audio", "quality", "button_color"}
 
 
 def load_catalogue(path: str | Path) -> list[dict[str, Any]]:
-    with Path(path).open(encoding="utf-8") as handle:
-        records = json.load(handle)
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Catalogue file not found: {path}")
+    try:
+        with path.open(encoding="utf-8") as handle:
+            records = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid catalogue JSON in {path} at line {exc.lineno}, column {exc.colno}") from exc
     if not isinstance(records, list):
         raise ValueError("Catalogue must be a JSON array")
+    if not records:
+        raise ValueError(f"Catalogue is empty: {path}; refusing to mark it as imported")
 
     validated: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
