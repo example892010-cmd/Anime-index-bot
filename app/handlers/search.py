@@ -26,6 +26,7 @@ async def search(message: Message, db, bot):
         text="❌ Anime not found.\n\nPlease check the spelling or try another title."
         if suggestions: text += "\n\nDid you mean:\n"+"\n".join(f"• {r['title']}" for r in suggestions)
         await message.answer(text); return
+    shared_poster=await db.get_setting("shared_landscape_poster", "")
     for row in rows[:5]:
         links=await db.links_for_anime(row["id"])
         text=f"✦ <b>{row['title']}</b>\n\n📺 Type: {row['anime_type']}\n🎙️ Audio: {row['audio_language'] or 'Not specified'}\n📦 Available links: {len(links)}"
@@ -36,6 +37,6 @@ async def search(message: Message, db, bot):
         buttons=[[InlineKeyboardButton(text=l["display_title"],url=l["url"])] for l in links]
         markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
         try:
-            if row["poster"]: await message.answer_photo(row["poster"],caption=text,parse_mode="HTML",reply_markup=markup)
+            if shared_poster or row["poster"]: await message.answer_photo(shared_poster or row["poster"],caption=text,parse_mode="HTML",reply_markup=markup)
             else: await message.answer(text,parse_mode="HTML",reply_markup=markup)
         except Exception: await message.answer(text,parse_mode="HTML",reply_markup=markup)
