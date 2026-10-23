@@ -14,8 +14,8 @@ async def show_browse(message, db, bot, user_id: int):
         await message.answer(await db.get_setting("force_sub_message"), reply_markup=force_sub_keyboard(missing))
         return
     rows = await db._fetchall("SELECT title FROM anime WHERE active=1 ORDER BY title LIMIT 50")
-    body = "\\n".join("• " + escape(r[0]) for r in rows)
-    await message.answer("📚 Anime catalog:\\n" + (body if body else "No anime has been added yet."))
+    body = "\n".join("• " + escape(r[0]) for r in rows)
+    await message.answer("📚 Anime catalog:\n" + (body if body else "No anime has been added yet."))
 
 @router.message(Command("browse"))
 async def browse(message: Message, db, bot):
