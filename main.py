@@ -147,15 +147,66 @@ def render_post_text(anime, expiry=None):
     return template
 
 
+def normalize_search(value):
+    """Normalize case and punctuation for forgiving anime-name matching."""
+    value = (value or "").casefold().strip()
+    value = re.sub(r"[^\w\s]", " ", value)
+    return " ".join(value.split())
+
+
 def get_anime(name):
-    """Find by display name or configured search name, case-insensitively."""
+    """Find by display name or configured search name: exact match first, then smart substring/fuzzy."""
+    target_raw = (name or "").strip()
+    if not target_raw:
+        return None
+
     with db_lock:
-        return db.execute(
+        # Step 1: Exact case-insensitive match on name or search_name
+        row = db.execute(
             "SELECT id,name,poster_file_id,button_name,direct_url,search_name "
             "FROM anime WHERE lower(name)=lower(?) OR lower(COALESCE(search_name,''))=lower(?) "
             "ORDER BY id LIMIT 1",
-            (name.strip(), name.strip())
+            (target_raw, target_raw)
         ).fetchone()
+        if row:
+            return row
+
+        # Step 2: Substring / Smart ratio match against SQLite records
+        all_rows = db.execute(
+            "SELECT id,name,poster_file_id,button_name,direct_url,search_name "
+            "FROM anime ORDER BY lower(name)"
+        ).fetchall()
+
+    target_clean = normalize_search(target_raw)
+    if not target_clean or not all_rows:
+        return None
+
+    best_match = None
+    best_score = 0.0
+
+    for r in all_rows:
+        candidate_names = [r[1], r[5] or "", r[3] or ""]
+        for cand in candidate_names:
+            cand_clean = normalize_search(cand)
+            if not cand_clean:
+                continue
+            # Exact clean match
+            if target_clean == cand_clean:
+                return r
+            # Substring match
+            if target_clean in cand_clean or cand_clean in target_clean:
+                score = 0.85
+            else:
+                score = difflib.SequenceMatcher(None, target_clean, cand_clean).ratio()
+
+            if score > best_score:
+                best_score = score
+                best_match = r
+
+    if best_score >= 0.72:
+        return best_match
+
+    return None
 
 
 def all_anime():
@@ -272,13 +323,6 @@ def availability_text():
     return "\n".join(lines)
 
 
-def normalize_search(value):
-    """Normalize case and punctuation for forgiving anime-name matching."""
-    value = (value or "").casefold().strip()
-    value = re.sub(r"[^\w\s]", " ", value)
-    return " ".join(value.split())
-
-
 def search_anime_suggestions(query, limit=3):
     """Return likely matches first, then random entries when no close match exists."""
     rows = all_anime()
@@ -375,7 +419,6 @@ async def send_anime_list(chat_id, context):
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Public command: every user can see the currently configured anime entries.
     await send_anime_list(update.effective_chat.id, context)
 
 
@@ -417,6 +460,7 @@ async def add_entry(update, context, raw):
     response.append("\nUsers can search using the anime name in the third field.")
     response.append("📂 TXT import format: BUTTON NAME - URL - anime name (one entry per line).")
     await update.effective_message.reply_text("\n".join(response))
+
 
 async def import_anime_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only TXT importer; each line uses BUTTON NAME - URL - anime name."""
@@ -491,7 +535,6 @@ async def setphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def poster_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Save a global poster when the admin selected Same Poster in the panel."""
     if not update.effective_user or not is_admin(update.effective_user.id):
         return
     if context.user_data.get("state") != "global_poster":
@@ -523,6 +566,7 @@ async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, s
             message += "\n\n🎲 You may also like:"
         await update.effective_message.reply_text(message, reply_markup=markup)
         return
+
     # Direct-link entries use the URL provided by the admin. Legacy channel entries
     # continue to use expiring Telegram invite links.
     if row[4]:
@@ -619,7 +663,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = "remove"
         await q.edit_message_text(
             "🗑️ Send the anime name, button name, or exact saved link to remove.\n"
-        "Example: naruto or https://example.com/naruto",
+            "Example: naruto or https://example.com/naruto",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:home")]])
         )
     elif q.data == "admin:poster":
@@ -672,17 +716,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def group_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gemini-style universal group search for every human member.
-
-    Group text always goes to anime search, including messages from the owner and
-    admins. Admin conversation states are handled only in private chat, so an
-    admin typing an anime name in a group cannot accidentally trigger an add,
-    remove, expiry, or post-text state.
-    """
+    """Direct group search for all group members, admins, and the bot owner."""
     user = update.effective_user
     message = update.effective_message
     if not user or user.is_bot or not message or not message.text:
         return
+
+    text = message.text.strip()
+    # Ignore commands or excessively long chat messages
+    if text.startswith("/") or len(text) > 100:
+        return
+
     await send_anime_links(update, context)
 
 
@@ -763,25 +807,31 @@ async def setup():
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     telegram_app.add_handler(MessageHandler(filters.PHOTO, poster_photo_handler))
     telegram_app.add_handler(MessageHandler(filters.Document.ALL, import_anime_file))
-    # Group search: works in groups/supergroups where the bot is an administrator.
+    
+    # Direct group search for any member, admin, or owner
     telegram_app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
         group_text_router
     ))
-    # Private-chat text handler remains separate from group messages.
+    
+    # Private chat text handler for admins & private searches
     telegram_app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         admin_text_router
     ))
+    
     await telegram_app.start()
     if not WEBHOOK_URL:
         raise RuntimeError("WEBHOOK_URL is missing. Set it to your Render public URL.")
+    
+    # Explicitly allow all updates to ensure group messages are received
     await telegram_app.bot.set_webhook(
         url=f"{WEBHOOK_URL}/webhook",
         secret_token=WEBHOOK_SECRET or None,
-        drop_pending_updates=True
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
     )
-    logger.info("Webhook set: %s/webhook", WEBHOOK_URL)
+    logger.info("Webhook set: %s/webhook with allowed_updates=ALL_TYPES", WEBHOOK_URL)
 
 
 bot_loop = asyncio.new_event_loop()
