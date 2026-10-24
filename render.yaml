@@ -1,22 +1,23 @@
 services:
-  - type: worker
-    name: aniflix-anime-finder-bot
-    env: docker
-    dockerfilePath: ./Dockerfile
-    disk:
-      name: aniflix-data
-      mountPath: /data
-      sizeGB: 1
+  - type: web
+    name: anime-channel-finder
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT main:app
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: OWNER_ID
+      - key: ADMIN_IDS
         sync: false
-      - key: DATABASE_PATH
-        value: /data/aniflix.db
-      - key: BOT_NAME
-        value: ANIFLIX NETWORK TAMIL
-      - key: LOG_LEVEL
-        value: INFO
-      - key: TIMEZONE
-        value: Asia/Kolkata
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DEFAULT_EXPIRY_MINUTES
+        value: "10"
+      - key: DB_PATH
+        value: "/var/data/anime.db"
+    disk:
+      name: anime-data
+      mountPath: /var/data
+      sizeGB: 1

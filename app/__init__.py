@@ -1,1 +1,0 @@
-"""ANIFLIX bot application package."""
