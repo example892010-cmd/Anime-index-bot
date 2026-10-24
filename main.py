@@ -7,10 +7,12 @@ import io
 import random
 import difflib
 import re
+import html
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
@@ -46,7 +48,7 @@ db.execute("""
         search_name TEXT
     )
 """)
-# Migrate existing databases without deleting existing anime/posters/channels.
+# Migrate existing databases without altering existing schemas
 _existing_columns = {row[1] for row in db.execute("PRAGMA table_info(anime)").fetchall()}
 for _column, _definition in (
     ("button_name", "TEXT"),
@@ -78,7 +80,6 @@ db.commit()
 app = Flask(__name__)
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-# Add more names here if you want them to appear in the availability list.
 ANIME_CATALOG = ["Black Clover", "Black Clover Tamil"]
 ONGOING_ANIME_URL = "https://t.me/+cVwTJSgsEvUzNWZl"
 SUPPORT_GROUP_URL = "https://t.me/+4YfcdPoSdK9jYmVl"
@@ -136,77 +137,24 @@ def get_post_text():
 
 
 def render_post_text(anime, expiry=None):
-    """Render the admin-configured message with supported placeholders."""
+    """Render configured template without altering or dropping existing HTML entities."""
     template = get_post_text()
-    replacements = {
-        "{anime}": anime,
-        "{expiry}": str(expiry if expiry is not None else get_expiry()),
-    }
-    for placeholder, value in replacements.items():
-        template = template.replace(placeholder, value)
-    return template
-
-
-def normalize_search(value):
-    """Normalize case and punctuation for forgiving anime-name matching."""
-    value = (value or "").casefold().strip()
-    value = re.sub(r"[^\w\s]", " ", value)
-    return " ".join(value.split())
+    safe_anime = html.escape(str(anime))
+    safe_expiry = html.escape(str(expiry if expiry is not None else get_expiry()))
+    
+    rendered = template.replace("{anime}", safe_anime).replace("{expiry}", safe_expiry)
+    return rendered
 
 
 def get_anime(name):
-    """Find by display name or configured search name: exact match first, then smart substring/fuzzy."""
-    target_raw = (name or "").strip()
-    if not target_raw:
-        return None
-
+    """Find by display name or search name, case-insensitively and trimmed."""
     with db_lock:
-        # Step 1: Exact case-insensitive match on name or search_name
-        row = db.execute(
+        return db.execute(
             "SELECT id,name,poster_file_id,button_name,direct_url,search_name "
             "FROM anime WHERE lower(name)=lower(?) OR lower(COALESCE(search_name,''))=lower(?) "
             "ORDER BY id LIMIT 1",
-            (target_raw, target_raw)
+            (name.strip(), name.strip())
         ).fetchone()
-        if row:
-            return row
-
-        # Step 2: Substring / Smart ratio match against SQLite records
-        all_rows = db.execute(
-            "SELECT id,name,poster_file_id,button_name,direct_url,search_name "
-            "FROM anime ORDER BY lower(name)"
-        ).fetchall()
-
-    target_clean = normalize_search(target_raw)
-    if not target_clean or not all_rows:
-        return None
-
-    best_match = None
-    best_score = 0.0
-
-    for r in all_rows:
-        candidate_names = [r[1], r[5] or "", r[3] or ""]
-        for cand in candidate_names:
-            cand_clean = normalize_search(cand)
-            if not cand_clean:
-                continue
-            # Exact clean match
-            if target_clean == cand_clean:
-                return r
-            # Substring match
-            if target_clean in cand_clean or cand_clean in target_clean:
-                score = 0.85
-            else:
-                score = difflib.SequenceMatcher(None, target_clean, cand_clean).ratio()
-
-            if score > best_score:
-                best_score = score
-                best_match = r
-
-    if best_score >= 0.72:
-        return best_match
-
-    return None
 
 
 def all_anime():
@@ -233,7 +181,6 @@ def add_anime(name):
 
 
 def save_direct_anime(button_name, url, search_name):
-    """Insert or update a direct-link anime entry without creating Telegram invites."""
     button_name = button_name.strip()
     url = url.strip()
     search_name = search_name.strip()
@@ -256,7 +203,6 @@ def save_direct_anime(button_name, url, search_name):
 
 
 def remove_anime(identifier):
-    """Remove an entry by anime/search name, button label, or exact saved URL."""
     identifier = identifier.strip()
     if not identifier:
         return False
@@ -306,25 +252,13 @@ def admin_keyboard():
     ])
 
 
-def availability_text():
-    """Show each catalog title as available only when it has a configured channel."""
-    lines = ["🎬 <b>Search Anime</b>\n"]
-    names = list(ANIME_CATALOG)
-    for row in all_anime():
-        if not any(row[1].casefold() == n.casefold() for n in names):
-            names.append(row[1])
-
-    for name in names:
-        row = get_anime(name)
-        available = bool(row and (row[4] or channels_for(row[0])))
-        lines.append(f"{name} {'✅' if available else '❌'}")
-
-    lines.append("\n🔎 Send an anime name to get its channel link.")
-    return "\n".join(lines)
+def normalize_search(value):
+    value = (value or "").casefold().strip()
+    value = re.sub(r"[^\w\s]", " ", value)
+    return " ".join(value.split())
 
 
 def search_anime_suggestions(query, limit=3):
-    """Return likely matches first, then random entries when no close match exists."""
     rows = all_anime()
     if not rows:
         return []
@@ -336,13 +270,13 @@ def search_anime_suggestions(query, limit=3):
                     for n in names if n.strip()), default=0)
         if target and any(target in normalize_search(n) or normalize_search(n) in target
                           for n in names if n.strip()):
-            best = max(best, 0.82)
-        if best >= 0.48:
+            best = max(best, 0.85)
+        if best >= 0.50:
             scored.append((best, row))
     scored.sort(key=lambda item: item[0], reverse=True)
     if scored:
         return [row for _, row in scored[:limit]]
-    return random.sample(rows, min(limit, len(rows)))
+    return []
 
 
 def suggestion_keyboard(rows):
@@ -376,7 +310,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         f"⚙️ <b>Admin Panel</b>\n\n⏳ Current expiry: <b>{get_expiry()} minutes</b>",
-        parse_mode="HTML",
+        parse_mode=ParseMode.HTML,
         reply_markup=admin_keyboard()
     )
 
@@ -386,14 +320,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "⚙️ <b>Admin commands</b>\n\n"
             "/admin — Open panel\n"
-            "/add BUTTON - URL - anime name — Add one or many direct links\n"
+            "/add BUTTON - URL - anime name — Add direct links\n"
             "/remove Anime — Remove anime\n"
             "/setexpiry 10 — Set expiry\n"
             "/setphoto Anime — Reply to a photo\n"
             "/list — List anime\n"
             "Upload a .txt file to import multiple anime entries.\n\n"
-            "👤 Users can send an anime name to search.",
-            parse_mode="HTML"
+            "👤 Users can send an anime name directly in chat or group to search.",
+            parse_mode=ParseMode.HTML
         )
     else:
         await start(update, context)
@@ -410,12 +344,12 @@ async def send_anime_list(chat_id, context):
         direct = row[4] if len(row) > 4 else None
         button_name = row[3] if len(row) > 3 else None
         if direct:
-            lines.append(f"🎬 <b>{row[1]}</b> — direct link ({button_name or row[1]})")
+            lines.append(f"🎬 <b>{html.escape(row[1])}</b> — direct link ({html.escape(button_name or row[1])})")
         else:
-            lines.append(f"🎬 <b>{row[1]}</b> — {len(chs)} channel(s)")
+            lines.append(f"🎬 <b>{html.escape(row[1])}</b> — {len(chs)} channel(s)")
         for ch in chs:
-            lines.append(f" • {ch[2]}")
-    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+            lines.append(f" • {html.escape(ch[2])}")
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,13 +357,12 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_entry(update, context, raw):
-    """Accept one or many lines: BUTTON NAME - URL - anime search name."""
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     if not lines:
         await update.effective_message.reply_text(
             "Send one or more lines in this format:\n"
             "<code>NARUTO - https://example.com/naruto - naruto</code>",
-            parse_mode="HTML"
+            parse_mode=ParseMode.HTML
         )
         return
 
@@ -442,28 +375,23 @@ async def add_entry(update, context, raw):
             continue
         button_name, url, search_name = parts
         if not button_name or not search_name or not url.startswith(("https://", "http://")):
-            errors.append(f"Line {line_no}: button name, anime name, and a valid http(s) URL are required")
+            errors.append(f"Line {line_no}: button name, anime name, and a valid URL are required")
             continue
         try:
             save_direct_anime(button_name, url, search_name)
             added += 1
         except sqlite3.Error:
             logger.exception("Could not save anime entry on line %s", line_no)
-            errors.append(f"Line {line_no}: database error; entry was not saved")
+            errors.append(f"Line {line_no}: database error")
 
     context.user_data.pop("state", None)
     response = [f"✅ Saved {added} anime entr{'y' if added == 1 else 'ies'}." if added else "❌ No anime entries were saved."]
     if errors:
         response.append("\n⚠️ Problems:\n" + "\n".join(errors[:20]))
-        if len(errors) > 20:
-            response.append(f"\n…and {len(errors) - 20} more error(s).")
-    response.append("\nUsers can search using the anime name in the third field.")
-    response.append("📂 TXT import format: BUTTON NAME - URL - anime name (one entry per line).")
     await update.effective_message.reply_text("\n".join(response))
 
 
 async def import_anime_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only TXT importer; each line uses BUTTON NAME - URL - anime name."""
     if not update.effective_user or not is_admin(update.effective_user.id):
         await update.effective_message.reply_text("❌ Only admins can import anime files.")
         return
@@ -481,7 +409,7 @@ async def import_anime_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         contents = buffer.getvalue().decode("utf-8-sig")
     except UnicodeDecodeError:
-        await update.effective_message.reply_text("❌ File must be UTF-8 text. Please save it as UTF-8 and upload again.")
+        await update.effective_message.reply_text("❌ File must be UTF-8 text.")
         return
     await add_entry(update, context, contents)
 
@@ -545,16 +473,51 @@ async def poster_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     set_setting("global_poster_file_id", message.photo[-1].file_id)
     set_setting("poster_mode", "global")
     context.user_data.pop("state", None)
-    await message.reply_text(
-        "✅ Same poster saved. It will be used for anime entries without their own separate poster."
-    )
+    await message.reply_text("✅ Global poster saved.")
 
 
-async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, search_override=None):
+async def deliver_post(update: Update, caption: str, markup: InlineKeyboardMarkup, poster_id: str = None):
+    """Deliver result safely in HTML mode, falling back to plain text if syntax tags mismatch."""
+    if poster_id:
+        try:
+            await update.effective_message.reply_photo(
+                photo=poster_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup
+            )
+            return
+        except TelegramError as e:
+            logger.warning("Photo send with HTML failed: %s. Retrying plain text.", e)
+            try:
+                await update.effective_message.reply_photo(
+                    photo=poster_id, caption=caption, parse_mode=None, reply_markup=markup
+                )
+                return
+            except TelegramError as err2:
+                logger.error("Poster photo failed entirely: %s", err2)
+
+    try:
+        await update.effective_message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except TelegramError:
+        await update.effective_message.reply_text(caption, parse_mode=None, reply_markup=markup)
+
+
+async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, search_override=None, is_group=False):
     name = (search_override or update.effective_message.text or "").strip()
     row = get_anime(name)
+
     if not row:
         suggestions = search_anime_suggestions(name, limit=3)
+        # In groups, only respond if there is a strong fuzzy suggestion so regular chatter isn't spammed
+        if is_group:
+            if not suggestions:
+                return
+            markup = suggestion_keyboard(suggestions)
+            await update.effective_message.reply_text(
+                f"Did you mean one of these for <b>{html.escape(name)}</b>?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup
+            )
+            return
+
         markup = suggestion_keyboard(suggestions)
         message = (
             "❌ No Anime Found!\n\n"
@@ -567,24 +530,17 @@ async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         await update.effective_message.reply_text(message, reply_markup=markup)
         return
 
-    # Direct-link entries use the URL provided by the admin. Legacy channel entries
-    # continue to use expiring Telegram invite links.
+    poster_id = get_global_poster() if get_poster_mode() == "global" else row[2]
+
+    # Direct-link entries
     if row[4]:
         button_label = row[3] or row[1]
         markup = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=row[4])]])
         caption = render_post_text(row[1])
-        poster_id = get_global_poster() if get_poster_mode() == "global" else row[2]
-        if poster_id:
-            try:
-                await update.effective_message.reply_photo(
-                    photo=poster_id, caption=caption, parse_mode="HTML", reply_markup=markup
-                )
-                return
-            except TelegramError as e:
-                logger.warning("Poster send failed: %s", e)
-        await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
+        await deliver_post(update, caption, markup, poster_id)
         return
 
+    # Channels / Invite link entries
     chs = channels_for(row[0])
     if not chs:
         await update.effective_message.reply_text("❌ This anime is listed but has no link configured yet.")
@@ -607,23 +563,13 @@ async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, s
 
     if not buttons:
         await update.effective_message.reply_text(
-            "❌ I found the anime, but couldn't create its channel link. "
-            "The bot needs administrator permission to manage invite links."
+            "❌ Could not create invite links. Ensure the bot is an admin in the channel."
         )
         return
 
     caption = render_post_text(row[1], expiry=expiry)
     markup = InlineKeyboardMarkup(buttons)
-    poster_id = get_global_poster() if get_poster_mode() == "global" else row[2]
-    if poster_id:
-        try:
-            await update.effective_message.reply_photo(
-                photo=poster_id, caption=caption, parse_mode="HTML", reply_markup=markup
-            )
-            return
-        except TelegramError as e:
-            logger.warning("Poster send failed: %s", e)
-    await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
+    await deliver_post(update, caption, markup, poster_id)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -633,14 +579,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             anime_id = int(q.data.split(":", 1)[1])
         except (ValueError, IndexError):
-            await q.answer("Invalid anime selection.", show_alert=True)
             return
         row = next((item for item in all_anime() if item[0] == anime_id), None)
         if not row:
-            await q.message.reply_text("❌ This anime is no longer available. Type /list to browse anime.")
+            await q.message.reply_text("❌ This anime is no longer available.")
             return
         await send_anime_links(update, context, search_override=row[5] or row[1])
         return
+
     if not is_admin(q.from_user.id):
         await q.answer("Admin only.", show_alert=True)
         return
@@ -648,28 +594,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "admin:home":
         await q.edit_message_text(
             f"⚙️ <b>Admin Panel</b>\n\n⏳ Current expiry: <b>{get_expiry()} minutes</b>",
-            parse_mode="HTML", reply_markup=admin_keyboard()
+            parse_mode=ParseMode.HTML, reply_markup=admin_keyboard()
         )
     elif q.data == "admin:add":
         context.user_data["state"] = "add"
         await q.edit_message_text(
-            "➕ <b>Add Anime</b>\n\nSend one or more lines in this format:\n"
-            "<code>NARUTO - https://example.com/naruto - naruto</code>\n\n"
-            "You can paste 4, 50, or more anime entries at once.",
-            parse_mode="HTML",
+            "➕ <b>Add Anime</b>\n\nSend lines in this format:\n"
+            "<code>NARUTO - https://example.com/naruto - naruto</code>",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:home")]])
         )
     elif q.data == "admin:remove":
         context.user_data["state"] = "remove"
         await q.edit_message_text(
-            "🗑️ Send the anime name, button name, or exact saved link to remove.\n"
-            "Example: naruto or https://example.com/naruto",
+            "🗑️ Send the anime name or direct link to remove:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:home")]])
         )
     elif q.data == "admin:poster":
         await q.edit_message_text(
-            "🖼️ <b>Set Poster</b>\n\nChoose how you want to set posters:",
-            parse_mode="HTML",
+            "🖼️ <b>Set Poster</b>\n\nChoose poster mode:",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🖼️ Separate Poster", callback_data="admin:poster_separate")],
                 [InlineKeyboardButton("🌐 Same Poster", callback_data="admin:poster_global")],
@@ -680,28 +624,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("state", None)
         set_setting("poster_mode", "separate")
         await q.edit_message_text(
-            "🖼️ <b>Separate Poster</b>\n\nReply to a poster photo with:\n"
-            "<code>/setphoto Anime Name</code>\n\n"
-            "Example: reply to the Naruto poster with <code>/setphoto naruto</code>.",
-            parse_mode="HTML",
+            "Reply to a poster photo with:\n<code>/setphoto Anime Name</code>",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:poster")]])
         )
     elif q.data == "admin:poster_global":
         context.user_data["state"] = "global_poster"
         await q.edit_message_text(
-            "🌐 <b>Same Poster</b>\n\nSend the poster photo you want to use for all anime entries. "
-            "Anime with a separate poster will keep their own poster; other anime will use this same poster.",
-            parse_mode="HTML",
+            "Send the poster photo to use for all anime entries without a custom poster.",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:poster")]])
         )
     elif q.data == "admin:post_text":
         context.user_data["state"] = "post_text"
         await q.edit_message_text(
-            "📝 <b>Post Text</b>\n\nSend the message text to show when someone searches for an anime.\n"
-            "Supported placeholders: <code>{anime}</code> = anime name, "
-            "<code>{expiry}</code> = expiry minutes.\n\n"
+            "📝 <b>Post Text</b>\n\nSend the exact text you want to show when an anime is delivered.\n\n"
+            "Supported placeholders: <code>{anime}</code>, <code>{expiry}</code>.\n\n"
             "Current text:\n" + get_post_text(),
-            parse_mode="HTML",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:home")]])
         )
     elif q.data == "admin:list":
@@ -710,34 +650,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = "expiry"
         await q.edit_message_text(
             f"⏳ Current expiry: <b>{get_expiry()} minutes</b>\n\nSend a number from 1 to 1440.",
-            parse_mode="HTML",
+            parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin:home")]])
         )
 
 
 async def group_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Direct group search for all group members, admins, and the bot owner."""
+    """Processes messages inside groups and supergroups."""
     user = update.effective_user
     message = update.effective_message
     if not user or user.is_bot or not message or not message.text:
         return
-
-    text = message.text.strip()
-    # Ignore commands or excessively long chat messages
-    if text.startswith("/") or len(text) > 100:
-        return
-
-    await send_anime_links(update, context)
+    await send_anime_links(update, context, is_group=True)
 
 
 async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes private DMs between users/admins and the bot."""
     if not is_admin(update.effective_user.id):
-        await send_anime_links(update, context)
+        await send_anime_links(update, context, is_group=False)
         return
+
     state = context.user_data.get("state")
     if not state:
-        await send_anime_links(update, context)
+        await send_anime_links(update, context, is_group=False)
         return
+
     text = update.effective_message.text.strip()
 
     if state == "add":
@@ -759,13 +696,12 @@ async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Enter a number from 1 to 1440.")
     elif state == "post_text":
         if not text:
-            await update.effective_message.reply_text("Post text cannot be empty. Send the text again.")
+            await update.effective_message.reply_text("Post text cannot be empty.")
             return
-        set_setting("post_text", text)
+        # Store exact text without altering formatting or symbols
+        set_setting("post_text", update.effective_message.text)
         context.user_data.pop("state", None)
-        await update.effective_message.reply_text(
-            "✅ Post text saved. It will be used for future anime search results."
-        )
+        await update.effective_message.reply_text("✅ Post text saved exactly as provided.")
 
 
 @app.get("/")
@@ -794,7 +730,7 @@ def webhook():
 
 async def setup():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing. Add it to your service environment variables.")
+        raise RuntimeError("BOT_TOKEN is missing. Add it to environment variables.")
     await telegram_app.initialize()
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("admin", admin))
@@ -808,30 +744,26 @@ async def setup():
     telegram_app.add_handler(MessageHandler(filters.PHOTO, poster_photo_handler))
     telegram_app.add_handler(MessageHandler(filters.Document.ALL, import_anime_file))
     
-    # Direct group search for any member, admin, or owner
+    # 1. Group & Supergroup Text Handler
     telegram_app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
         group_text_router
     ))
-    
-    # Private chat text handler for admins & private searches
+    # 2. Private Chat Text Handler
     telegram_app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         admin_text_router
     ))
-    
+
     await telegram_app.start()
     if not WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_URL is missing. Set it to your Render public URL.")
-    
-    # Explicitly allow all updates to ensure group messages are received
+        raise RuntimeError("WEBHOOK_URL is missing.")
     await telegram_app.bot.set_webhook(
         url=f"{WEBHOOK_URL}/webhook",
         secret_token=WEBHOOK_SECRET or None,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
+        drop_pending_updates=True
     )
-    logger.info("Webhook set: %s/webhook with allowed_updates=ALL_TYPES", WEBHOOK_URL)
+    logger.info("Webhook set: %s/webhook", WEBHOOK_URL)
 
 
 bot_loop = asyncio.new_event_loop()
