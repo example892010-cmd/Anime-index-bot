@@ -672,16 +672,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def group_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ordinary text in groups where the bot is an administrator.
+    """Search anime for every human member in groups, including bot admins.
 
-    Commands are handled by CommandHandler. Ignore messages sent by other bots to
-    prevent bot-to-bot loops, then reuse the same anime search/admin flow.
+    Group text is always treated as an anime search. Admin management actions
+    remain available in private chat/through commands, so an admin's group
+    message cannot accidentally be consumed by a stale admin input state.
     """
     user = update.effective_user
     message = update.effective_message
     if not user or user.is_bot or not message or not message.text:
         return
-    await admin_text_router(update, context)
+    await send_anime_links(update, context)
 
 
 async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
