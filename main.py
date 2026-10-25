@@ -257,24 +257,38 @@ async def admin_command(
 
 
 # ---------------------------------------------------------
-# Start Command
+# Start Command - Updated Welcome Message
 # ---------------------------------------------------------
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     welcome_text = (
-        f"🍥 *WELCOME TO {BOT_TITLE}* 🍥\n\n"
-        "🔎 Just type the anime name you want to search.\n"
-        "Example: `Naruto`\n\n"
-        "📚 Use /list to see all available anime.\n\n"
-        "❗ If no anime is found, check the spelling and try again."
+        "╔════════════════════════════════════════╗\n"
+        "   ✧ ✦ 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𝐀𝐍𝐈𝐅𝐋𝐈𝐗 𝐁𝐎𝐓 ✦ ✧\n"
+        "       『 ᴀɴɪᴍᴇ ɪɴᴅᴇx • ᴛᴀᴍɪʟ 』\n"
+        "╚════════════════════════════════════════╝\n\n"
+        "╭─► ⌕ Just type the Anime Name to search\n"
+        "│   ‣ ᴇxᴀᴍᴘʟᴇ: Naruto\n"
+        "│\n"
+        "│ ‣ 📚 /list ➔ View full anime database\n"
+        "│\n"
+        "│ ‣ ⚠ If no anime is found, check the\n"
+        "│   spelling and try again!\n"
+        "│ POWERED BY : @ANIFLIXANIMETAMIL\n"
+        "╰───────────────────────────────"
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("📢 Channel", url="https://t.me/"),
-            InlineKeyboardButton("👥 Support Group", url="https://t.me/"),
+            InlineKeyboardButton(
+                "📢 ONGOING ANIME",
+                url="https://t.me/+cVwTJSgsEvUzNWZl",
+            ),
+            InlineKeyboardButton(
+                "👥 Support Group",
+                url="https://t.me/+4YfcdPoSdK9jYmVl",
+            ),
         ],
         [
             InlineKeyboardButton(
@@ -287,7 +301,6 @@ async def start_command(
     await update.effective_message.reply_text(
         welcome_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
 
@@ -301,8 +314,7 @@ async def list_command(
 ):
     if not anime_database:
         await update.effective_message.reply_text(
-            f"📚 No anime added yet to *{BOT_TITLE}*.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"📚 No anime added yet to {BOT_TITLE}."
         )
         return
 
@@ -326,7 +338,8 @@ async def send_list_page(message, page: int, edit: bool = False):
     )
 
     for index, item in enumerate(current_items, start=start_idx + 1):
-        text += f"{index}. [{item['title']}]({item['link']})\n"
+        safe_title = item["title"].replace("[", "\\[").replace("]", "\\]")
+        text += f"{index}. [{safe_title}]({item['link']})\n"
 
     buttons = []
     navigation = []
@@ -467,7 +480,7 @@ async def import_txt_handler(
     )
 
     file_obj = await context.bot.get_file(document.file_id)
-    download_path = f"temp_{user.id}_{document.file_name}"
+    download_path = f"temp_{user.id}_{os.path.basename(document.file_name)}"
 
     try:
         await file_obj.download_to_drive(download_path)
@@ -610,6 +623,15 @@ async def handle_search_text(
         )
 
     else:
+        # Updated no-anime-found message.
+        not_found_text = (
+            f"╭─► ✖ 𝐍𝐨𝐭 𝐅𝐨𝐮𝐧𝐝: {query}\n"
+            "│\n"
+            "│ ‣ Check the spelling and try again.\n"
+            "│ ‣ Use /list to see all available anime.\n"
+            "╰───────────────────────────────"
+        )
+
         suggestions = get_random_suggestions(count=4)
         buttons = [
             [
@@ -621,15 +643,9 @@ async def handle_search_text(
             for anime in suggestions
         ]
 
-        not_found_text = (
-            f"❌ *Anime Not Found:* `{query}`\n\n"
-            "Please check the spelling and try again."
-        )
-
         await msg.reply_text(
             not_found_text,
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-            parse_mode=ParseMode.MARKDOWN,
         )
 
 
