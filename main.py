@@ -46,13 +46,10 @@ if OWNER_ID != 0:
 
 PORT = int(os.getenv("PORT", "8080"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-
 DB_FILE = os.getenv("DB_FILE", "anime_db.txt")
 BOT_TITLE = "ANIFLIX ANIME INDEX BOT TAMIL"
 
-# Admin conversations are tracked per Telegram user.
 ADMIN_ACTIONS = {}
-
 
 # ---------------------------------------------------------
 # Anime Database
@@ -60,8 +57,48 @@ ADMIN_ACTIONS = {}
 anime_database = []
 
 
+def parse_anime_line(line):
+    """Parse TITLE - URL - SEARCH NAME."""
+    match = re.match(
+        r"^(.+?)\s+-\s+(https?://\S+)\s+-\s+(.+)$",
+        line.strip(),
+    )
+
+    if match:
+        title, link, search_name = [
+            value.strip() for value in match.groups()
+        ]
+
+        if title and search_name:
+            return {
+                "title": title,
+                "link": link,
+                "search_name": search_name,
+            }
+
+    # Backward compatibility with old TITLE - URL entries.
+    old_match = re.match(
+        r"^(.+?)\s+-\s+(https?://\S+)\s*$",
+        line.strip(),
+    )
+
+    if old_match:
+        title, link = [
+            value.strip() for value in old_match.groups()
+        ]
+
+        if title:
+            return {
+                "title": title,
+                "link": link,
+                "search_name": title,
+            }
+
+    return None
+
+
 def load_database():
-    """Load anime titles and links from the database file."""
+    """Load anime entries from the database file."""
     global anime_database
     anime_database = []
 
@@ -75,36 +112,32 @@ def load_database():
             if not line or line.startswith("#"):
                 continue
 
-            parts = re.split(
-                r"\s*[-|,]\s*(https?://\S+)",
-                line,
-                maxsplit=1,
-            )
-
-            if len(parts) >= 2:
-                title = parts[0].strip()
-                link = parts[1].strip()
-
-                if title and link:
-                    anime_database.append({
-                        "title": title,
-                        "link": link,
-                    })
+            item = parse_anime_line(line)
+            if item:
+                anime_database.append(item)
 
 
-def save_anime_to_db(title: str, link: str):
-    """Add an anime to memory and append it to the database file."""
-    anime_database.append({
-        "title": title,
-        "link": link,
-    })
+def save_anime_to_db(title: str, link: str, search_name=None):
+    """Save title, link, and search name."""
+    search_name = (search_name or title).strip()
+
+    item = {
+        "title": title.strip(),
+        "link": link.strip(),
+        "search_name": search_name,
+    }
+
+    anime_database.append(item)
 
     with open(DB_FILE, "a", encoding="utf-8") as file:
-        file.write(f"{title} - {link}\n")
+        file.write(
+            f"{item['title']} - {item['link']} - "
+            f"{item['search_name']}\n"
+        )
 
 
 def remove_anime_from_db(title: str) -> bool:
-    """Remove an anime by exact title and update the database file."""
+    """Remove an anime by exact title."""
     global anime_database
 
     target = clean_query(title)
@@ -117,7 +150,8 @@ def remove_anime_from_db(title: str) -> bool:
                 for saved_item in anime_database:
                     file.write(
                         f"{saved_item['title']} - "
-                        f"{saved_item['link']}\n"
+                        f"{saved_item['link']} - "
+                        f"{saved_item.get('search_name', saved_item['title'])}\n"
                     )
 
             return True
@@ -126,7 +160,6 @@ def remove_anime_from_db(title: str) -> bool:
 
 
 def is_admin(user_id: int) -> bool:
-    """Check whether a Telegram user is an authorized admin."""
     return user_id in ADMIN_IDS or user_id == OWNER_ID
 
 
@@ -134,38 +167,43 @@ def is_admin(user_id: int) -> bool:
 # Smart Search
 # ---------------------------------------------------------
 def clean_query(text: str) -> str:
-    return re.sub(
-        r"[^a-zA-Z0-9\s]",
-        "",
-        text,
-    ).lower().strip()
+    return re.sub(r"[^a-zA-Z0-9\s]", "", text).lower().strip()
 
 
 def find_anime(query: str):
-    """Find an exact, partial, or fuzzy anime title match."""
+    """Find anime by title or search name."""
     clean_q = clean_query(query)
 
     if not clean_q:
         return None
 
-    # Exact or partial match.
     for item in anime_database:
-        clean_item = clean_query(item["title"])
+        title = clean_query(item["title"])
+        search_name = clean_query(
+            item.get("search_name", item["title"])
+        )
 
-        if clean_q == clean_item or clean_q in clean_item:
+        if (
+            clean_q == title
+            or clean_q == search_name
+            or clean_q in title
+            or clean_q in search_name
+        ):
             return item
 
-    # Fuzzy match.
     best_match = None
     best_ratio = 0.65
 
     for item in anime_database:
-        clean_item = clean_query(item["title"])
-        ratio = SequenceMatcher(
-            None,
-            clean_q,
-            clean_item,
-        ).ratio()
+        title = clean_query(item["title"])
+        search_name = clean_query(
+            item.get("search_name", item["title"])
+        )
+
+        ratio = max(
+            SequenceMatcher(None, clean_q, title).ratio(),
+            SequenceMatcher(None, clean_q, search_name).ratio(),
+        )
 
         if ratio > best_ratio:
             best_ratio = ratio
@@ -175,7 +213,6 @@ def find_anime(query: str):
 
 
 def get_random_suggestions(count: int = 5):
-    """Return random anime suggestions."""
     if not anime_database:
         return []
 
@@ -190,36 +227,11 @@ def get_random_suggestions(count: int = 5):
 # ---------------------------------------------------------
 def admin_panel_markup():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "➕ Add Anime",
-                callback_data="admin_add",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "➖ Remove Anime",
-                callback_data="admin_remove",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📥 Import TXT",
-                callback_data="admin_import",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📚 View Anime List",
-                callback_data="admin_list",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Cancel",
-                callback_data="admin_cancel",
-            )
-        ],
+        [InlineKeyboardButton("➕ Add Anime", callback_data="admin_add")],
+        [InlineKeyboardButton("➖ Remove Anime", callback_data="admin_remove")],
+        [InlineKeyboardButton("📥 Import TXT", callback_data="admin_import")],
+        [InlineKeyboardButton("📚 View Anime List", callback_data="admin_list")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel")],
     ])
 
 
@@ -227,7 +239,6 @@ async def admin_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Open the admin panel for authorized users."""
     user = update.effective_user
     message = update.effective_message
 
@@ -240,9 +251,7 @@ async def admin_command(
     ADMIN_ACTIONS.pop(user.id, None)
 
     await message.reply_text(
-        f"⚙️ {BOT_TITLE}\n\n"
-        "Admin Panel\n\n"
-        "Choose an action:",
+        f"⚙️ {BOT_TITLE}\n\nAdmin Panel\n\nChoose an action:",
         reply_markup=admin_panel_markup(),
     )
 
@@ -264,14 +273,8 @@ async def start_command(
 
     keyboard = [
         [
-            InlineKeyboardButton(
-                "📢 Channel",
-                url="https://t.me/",
-            ),
-            InlineKeyboardButton(
-                "👥 Support Group",
-                url="https://t.me/",
-            ),
+            InlineKeyboardButton("📢 Channel", url="https://t.me/"),
+            InlineKeyboardButton("👥 Support Group", url="https://t.me/"),
         ],
         [
             InlineKeyboardButton(
@@ -314,21 +317,15 @@ async def send_list_page(message, page: int, edit: bool = False):
     )
 
     page = max(0, min(page, total_pages - 1))
-
     start_idx = page * page_size
-    current_items = anime_database[
-        start_idx:start_idx + page_size
-    ]
+    current_items = anime_database[start_idx:start_idx + page_size]
 
     text = (
         f"📚 *{BOT_TITLE} | Available Anime "
         f"(Page {page + 1}/{total_pages})*\n\n"
     )
 
-    for index, item in enumerate(
-        current_items,
-        start=start_idx + 1,
-    ):
+    for index, item in enumerate(current_items, start=start_idx + 1):
         text += f"{index}. [{item['title']}]({item['link']})\n"
 
     buttons = []
@@ -372,45 +369,75 @@ async def send_list_page(message, page: int, edit: bool = False):
 
 
 # ---------------------------------------------------------
-# Existing /add Command
+# Bulk Add Helpers
+# ---------------------------------------------------------
+def add_anime_lines(text: str):
+    """Add up to 100 valid entries and report invalid lines."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    if len(lines) > 100:
+        return 0, lines, True
+
+    added = 0
+    invalid = []
+
+    for line in lines:
+        item = parse_anime_line(line)
+
+        if not item or not item.get("search_name"):
+            invalid.append(line)
+            continue
+
+        save_anime_to_db(
+            item["title"],
+            item["link"],
+            item["search_name"],
+        )
+        added += 1
+
+    return added, invalid, False
+
+
+# ---------------------------------------------------------
+# /add Command
 # ---------------------------------------------------------
 async def add_anime_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
+    user = update.effective_user
+    message = update.effective_message
+
+    if not user or not is_admin(user.id):
+        await message.reply_text(
             "⛔ You don't have permission to add anime."
         )
         return
 
-    raw_args = " ".join(context.args)
+    raw_args = message.text.partition(" ")[2].strip()
 
-    if " - " not in raw_args:
-        await update.effective_message.reply_text(
-            "⚠️ Invalid format.\n"
-            "Usage: /add Anime Name - https://t.me/link"
+    if not raw_args:
+        await message.reply_text(
+            "⚠️ Use this format:\n"
+            "/add NARUTO - https://example.com/naruto - naruto"
         )
         return
 
-    title, link = raw_args.split(" - ", 1)
-    title = title.strip()
-    link = link.strip()
+    added, invalid, too_many = add_anime_lines(raw_args)
 
-    if not title or not re.match(r"^https?://\S+$", link):
-        await update.effective_message.reply_text(
-            "⚠️ Please provide an anime title and a valid http(s) link."
+    if too_many:
+        await message.reply_text(
+            "⚠️ Maximum 100 anime entries per message. "
+            "Please split your list into smaller batches."
         )
         return
 
-    save_anime_to_db(title, link)
+    response = f"✅ Added {added} anime successfully."
 
-    await update.effective_message.reply_text(
-        f"✅ Anime Added Successfully!\n\n"
-        f"📌 Title: {title}\n"
-        f"🔗 {link}",
-        disable_web_page_preview=True,
-    )
+    if invalid:
+        response += f"\n⚠️ Skipped {len(invalid)} invalid line(s)."
+
+    await message.reply_text(response)
 
 
 # ---------------------------------------------------------
@@ -445,6 +472,7 @@ async def import_txt_handler(
     try:
         await file_obj.download_to_drive(download_path)
         imported_count = 0
+        invalid_count = 0
 
         with open(
             download_path,
@@ -458,23 +486,22 @@ async def import_txt_handler(
                 if not line or line.startswith("#"):
                     continue
 
-                parts = re.split(
-                    r"\s*[-|,]\s*(https?://\S+)",
-                    line,
-                    maxsplit=1,
-                )
+                item = parse_anime_line(line)
 
-                if len(parts) >= 2:
-                    title = parts[0].strip()
-                    link = parts[1].strip()
-
-                    if title and link:
-                        save_anime_to_db(title, link)
-                        imported_count += 1
+                if item:
+                    save_anime_to_db(
+                        item["title"],
+                        item["link"],
+                        item["search_name"],
+                    )
+                    imported_count += 1
+                else:
+                    invalid_count += 1
 
         await status_msg.edit_text(
             f"✅ Import complete!\n"
-            f"📚 Added {imported_count} anime entries."
+            f"📚 Added {imported_count} anime entries.\n"
+            f"⚠️ Skipped {invalid_count} invalid lines."
         )
 
     except Exception:
@@ -502,42 +529,43 @@ async def handle_search_text(
         return
 
     query = msg.text.strip()
-
-    # Process replies requested by the admin panel.
     action = ADMIN_ACTIONS.get(user.id)
 
-    if action and is_admin(user.id) and msg.chat.type == ChatType.PRIVATE:
+    if (
+        action
+        and is_admin(user.id)
+        and msg.chat.type == ChatType.PRIVATE
+    ):
         if query.startswith("/"):
             return
 
         if action == "add":
-            if " - " not in query:
+            added, invalid, too_many = add_anime_lines(query)
+
+            if too_many:
                 await msg.reply_text(
-                    "⚠️ Invalid format.\n"
-                    "Send: Anime Name - https://t.me/link"
+                    "⚠️ Maximum 100 anime entries per message. "
+                    "Please split your list into smaller batches."
                 )
                 return
 
-            title, link = query.split(" - ", 1)
-            title = title.strip()
-            link = link.strip()
+            if added:
+                ADMIN_ACTIONS.pop(user.id, None)
+                response = f"✅ Added {added} anime successfully!"
 
-            if not title or not re.match(r"^https?://\S+$", link):
+                if invalid:
+                    response += (
+                        f"\n⚠️ Skipped {len(invalid)} invalid line(s)."
+                    )
+
+                await msg.reply_text(response)
+            else:
                 await msg.reply_text(
-                    "⚠️ Please send a valid title and link:\n"
-                    "Anime Name - https://t.me/link"
+                    "⚠️ No valid entries found.\n\n"
+                    "➕ Add Anime\n\n"
+                    "Send lines in this format:\n"
+                    "NARUTO - https://example.com/naruto - naruto"
                 )
-                return
-
-            save_anime_to_db(title, link)
-            ADMIN_ACTIONS.pop(user.id, None)
-
-            await msg.reply_text(
-                f"✅ Anime added successfully!\n"
-                f"📌 Title: {title}\n"
-                f"🔗 {link}",
-                disable_web_page_preview=True,
-            )
             return
 
         if action == "remove":
@@ -545,16 +573,13 @@ async def handle_search_text(
             ADMIN_ACTIONS.pop(user.id, None)
 
             if removed:
-                await msg.reply_text(
-                    f"✅ Removed anime: {query}"
-                )
+                await msg.reply_text(f"✅ Removed anime: {query}")
             else:
                 await msg.reply_text(
                     f"❌ No exact title match found for: {query}"
                 )
             return
 
-    # Ignore commands and overly long messages.
     if query.startswith("/") or len(query) > 100:
         return
 
@@ -632,9 +657,10 @@ async def callback_query_handler(
         if data == "admin_add":
             ADMIN_ACTIONS[user.id] = "add"
             await query.message.reply_text(
-                "➕ Send the anime in this format:\n"
-                "Anime Name - https://t.me/link\n\n"
-                "Use /admin to cancel and reopen the panel."
+                "➕ Add Anime\n\n"
+                "Send lines in this format:\n"
+                "NARUTO - https://example.com/naruto - naruto\n\n"
+                "You can send up to 100 entries per message."
             )
             return
 
@@ -651,7 +677,7 @@ async def callback_query_handler(
             await query.message.reply_text(
                 "📥 Upload your .txt anime list in this private chat.\n"
                 "Each line should be:\n"
-                "Anime Name - https://t.me/link"
+                "NARUTO - https://example.com/naruto - naruto"
             )
             return
 
@@ -662,9 +688,7 @@ async def callback_query_handler(
 
         if data == "admin_cancel":
             ADMIN_ACTIONS.pop(user.id, None)
-            await query.message.reply_text(
-                "Admin action cancelled."
-            )
+            await query.message.reply_text("Admin action cancelled.")
             return
 
     if data.startswith("browse_list_"):
@@ -691,13 +715,11 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("add", add_anime_command))
 
-    # TXT import in private chat
     app.add_handler(
         MessageHandler(
             filters.Document.FileExtension("txt")
@@ -706,12 +728,8 @@ def main():
         )
     )
 
-    # Admin panel and list pagination buttons
-    app.add_handler(
-        CallbackQueryHandler(callback_query_handler)
-    )
+    app.add_handler(CallbackQueryHandler(callback_query_handler))
 
-    # Search for non-command text in groups and private chats
     app.add_handler(
         MessageHandler(
             filters.TEXT
@@ -732,9 +750,7 @@ def main():
         )
     else:
         logger.info("Running via Long Polling...")
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES
-        )
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
