@@ -84,7 +84,9 @@ DEFAULT_SETTINGS = {
     "expiry_minutes": 10,
     "post_text": (
         "🍥 {anime}\n\n"
-        "🎧 Audio: Tamil Audio\n"
+        "🎭 Genre: {genre}\n"
+        "⭐ Rating: {rating}\n"
+        "🎧 Audio: Tamil Audio\n\n"
         "📥 Click the button below to get your anime.\n\n"
         "Powered By: @ANIFLIXANIMETAMIL"
     ),
@@ -114,6 +116,16 @@ def load_settings():
             if isinstance(saved, dict):
                 settings_data.update(saved)
             # Repair older or malformed settings without discarding saved values.
+            # Upgrade the previous built-in default template to include genre/rating,
+            # but preserve any custom template the admin already created.
+            old_default_post_text = (
+                "🍥 {anime}\n\n"
+                "🎧 Audio: Tamil Audio\n"
+                "📥 Click the button below to get your anime.\n\n"
+                "Powered By: @ANIFLIXANIMETAMIL"
+            )
+            if settings_data.get("post_text") == old_default_post_text:
+                settings_data["post_text"] = DEFAULT_SETTINGS["post_text"]
             if not isinstance(settings_data.get("posters"), dict):
                 settings_data["posters"] = {}
             if not isinstance(settings_data.get("random_posters"), list):
@@ -147,17 +159,25 @@ def load_anime():
         return anime
 
     for line in DB_FILE.read_text(encoding="utf-8").splitlines():
-        parts = [part.strip() for part in line.split(" - ", 2)]
+        # New format: BUTTON NAME - URL - GENRE - RATING - SEARCH NAME
+        # Legacy 3-field lines are still accepted to protect existing data.
+        parts = [part.strip() for part in line.split(" - ")]
 
-        if len(parts) != 3:
+        if len(parts) >= 5:
+            button_name, url, genre, rating = parts[:4]
+            search_name = " - ".join(parts[4:]).strip()
+        elif len(parts) == 3:
+            button_name, url, search_name = parts
+            genre, rating = "Not specified", "N/A"
+        else:
             continue
 
-        button_name, url, search_name = parts
-
-        if button_name and url.startswith(("https://", "http://")):
+        if button_name and url.startswith(("https://", "http://")) and search_name:
             anime.append({
                 "button_name": button_name,
                 "url": url,
+                "genre": genre or "Not specified",
+                "rating": rating or "N/A",
                 "search_name": search_name,
             })
 
@@ -166,7 +186,7 @@ def load_anime():
 
 def save_anime(anime):
     lines = [
-        f"{item['button_name']} - {item['url']} - {item['search_name']}"
+        f"{item['button_name']} - {item['url']} - {item.get('genre', 'Not specified')} - {item.get('rating', 'N/A')} - {item['search_name']}"
         for item in anime
     ]
     DB_FILE.write_text(
@@ -431,6 +451,8 @@ async def send_anime_result(
         link=item["url"],
         bot_title="ANIFLIX ANIME INDEX BOT TAMIL",
         expiry=settings.get("expiry_minutes", 10),
+        genre=item.get("genre", "Not specified"),
+        rating=item.get("rating", "N/A"),
     )
 
     keyboard = InlineKeyboardMarkup([[
@@ -499,20 +521,57 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_anime_result(update, exact_or_partial[0], context)
         return
 
-    # Editable no-result text, followed by varied suggestions on each search.
+    # Editable no-result text, followed by random inline buttons that open
+    # each suggested anime's own download URL. Keep suggestions out of the text.
     no_result_text = settings.get(
         "no_anime_text", DEFAULT_SETTINGS["no_anime_text"]
     )
     no_result_text = render_template(no_result_text, query=query)
 
     suggestions = random_anime_suggestions(context, limit=5)
+    suggestion_keyboard = None
     if suggestions:
-        suggestion_lines = "\n".join(
-            f"• {item['button_name']}" for item in suggestions
-        )
-        no_result_text += "\n\n🎯 You may also like:\n" + suggestion_lines
+        suggestion_rows = [
+            [InlineKeyboardButton(
+                f"🎬 {item['button_name']}"[:64],
+                url=item["url"],
+            )]
+            for item in suggestions
+        ]
+        suggestion_keyboard = InlineKeyboardMarkup(suggestion_rows)
 
-    await message.reply_text(no_result_text)
+    await message.reply_text(
+        no_result_text,
+        reply_markup=suggestion_keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+# =========================
+# ANIME ENTRY PARSER
+# =========================
+
+def parse_anime_entry(line):
+    """Parse the current 5-field format, while accepting legacy 3-field lines."""
+    parts = [part.strip() for part in line.split(" - ")]
+    if len(parts) >= 5:
+        button_name, url, genre, rating = parts[:4]
+        search_name = " - ".join(parts[4:]).strip()
+    elif len(parts) == 3:
+        button_name, url, search_name = parts
+        genre, rating = "Not specified", "N/A"
+    else:
+        return None
+
+    if not button_name or not url.startswith(("https://", "http://")) or not search_name:
+        return None
+    return {
+        "button_name": button_name,
+        "url": url,
+        "genre": genre or "Not specified",
+        "rating": rating or "N/A",
+        "search_name": search_name,
+    }
 
 
 # =========================
@@ -593,7 +652,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("admin_action", None)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 Global Poster", callback_data="admin_global_poster")],
-            [InlineKeyboardButton("🎲 Random Poster", callback_data="admin_random_poster")],
+            [InlineKeyboardButton("🎲 Random Poster", callback_data="admin_random_poster_menu")],
             [InlineKeyboardButton("⬅️ Back", callback_data="admin_poster_settings")],
         ])
         await query.message.reply_text(
@@ -601,6 +660,53 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Global Poster: one image for every anime unless a separate poster is set.\n"
             "Random Poster: collect up to 20 images and randomly use one for each post.",
             reply_markup=keyboard,
+        )
+        return
+
+    if action == "admin_random_poster_menu":
+        context.user_data.pop("admin_action", None)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add More", callback_data="admin_random_add_more")],
+            [InlineKeyboardButton("🗑️ Clear From First", callback_data="admin_random_clear_first")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin_poster_global_menu")],
+        ])
+        current_count = len(settings.get("random_posters", []))
+        await query.message.reply_text(
+            f"🎲 RANDOM POSTER SETTINGS\n\nSaved posters: {current_count}/20\n\n"
+            "Add More keeps your saved posters. Clear From First starts a fresh collection.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "admin_random_add_more":
+        existing = list(settings.get("random_posters", []))[:20]
+        if len(existing) >= 20:
+            await query.message.reply_text("⚠️ You already have 20 posters. Clear the collection before adding more.")
+            return
+        context.user_data["random_poster_collection"] = existing
+        context.user_data["random_poster_start_count"] = len(existing)
+        context.user_data["admin_action"] = "admin_random_poster"
+        await query.message.reply_text(
+            f"➕ Send additional poster photos. You have {len(existing)}/20 saved; you can add {20-len(existing)} more.\n"
+            "Tap Done when finished.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done")],
+                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel")],
+            ]),
+        )
+        return
+
+    if action == "admin_random_clear_first":
+        context.user_data["admin_action"] = "admin_random_poster"
+        context.user_data["random_poster_collection"] = []
+        context.user_data["random_poster_start_count"] = 0
+        await query.message.reply_text(
+            "🗑️ Old random poster collection cleared from the new setup. Send up to 20 new poster photos, then tap Done.\n"
+            "The previously saved collection will only be replaced when you tap Done.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done")],
+                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel")],
+            ]),
         )
         return
 
@@ -631,7 +737,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("The anime list is empty.")
         else:
             lines = [
-                f"{i}. {item['button_name']} | {item['url']}"
+                f"{i}. {item['button_name']} | {item.get('genre', 'Not specified')} | {item.get('rating', 'N/A')} | {item['url']}"
                 for i, item in enumerate(anime, start=1)
             ]
             for start_index in range(0, len(lines), 40):
@@ -641,13 +747,15 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     instructions = {
         "admin_add": (
             "Send anime entries in this format:\n"
-            "BUTTON NAME - URL - SEARCH NAME\n\n"
+            "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n\n"
+            "Example:\nNaruto - https://example.com/naruto - Action, Adventure - 8.4 - naruto\n\n"
             "You can send multiple lines."
         ),
         "admin_remove": "Send the anime title or URL you want to remove.",
         "admin_import": (
             "Upload a .txt file with one entry per line:\n"
-            "BUTTON NAME - URL - SEARCH NAME"
+            "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n"
+            "Example:\nNaruto - https://example.com/naruto - Action, Adventure - 8.4 - naruto"
         ),
         "admin_global_poster": "Send one photo to use as the global poster.",
         "admin_random_poster": (
@@ -656,7 +764,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         "admin_post_text": (
             "Send your post template.\n"
-            "Available placeholders: {anime}, {link}, {bot_title}, {expiry}"
+            "Available placeholders: {anime}, {link}, {bot_title}, {expiry}, {genre}, {rating}"
         ),
         "admin_welcome_text": (
             "Send the new /start welcome message.\n"
@@ -677,7 +785,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["admin_action"] = action
     if action == "admin_random_poster":
-        context.user_data["random_poster_collection"] = []
+        context.user_data["random_poster_collection"] = list(settings.get("random_posters", []))[:20]
     await query.message.reply_text(instructions[action])
 
 
@@ -698,15 +806,12 @@ async def process_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "admin_add":
         added = 0
         for line in text.splitlines():
-            parts = [p.strip() for p in line.split(" - ", 2)]
-            if len(parts) != 3:
+            entry = parse_anime_entry(line)
+            if not entry:
                 continue
-            button_name, url, search_name = parts
-            if not url.startswith(("https://", "http://")):
+            if any(normalize(item["search_name"]) == normalize(entry["search_name"]) for item in anime):
                 continue
-            if any(normalize(item["search_name"]) == normalize(search_name) for item in anime):
-                continue
-            anime.append({"button_name": button_name, "url": url, "search_name": search_name})
+            anime.append(entry)
             added += 1
 
         save_anime(anime)
@@ -873,15 +978,12 @@ async def process_admin_document(update: Update, context: ContextTypes.DEFAULT_T
     added = 0
 
     for line in imported_text.splitlines():
-        parts = [p.strip() for p in line.split(" - ", 2)]
-        if len(parts) != 3:
+        entry = parse_anime_entry(line)
+        if not entry:
             continue
-        button_name, url, search_name = parts
-        if not url.startswith(("https://", "http://")):
+        if any(normalize(item["search_name"]) == normalize(entry["search_name"]) for item in anime):
             continue
-        if any(normalize(item["search_name"]) == normalize(search_name) for item in anime):
-            continue
-        anime.append({"button_name": button_name, "url": url, "search_name": search_name})
+        anime.append(entry)
         added += 1
 
     save_anime(anime)
