@@ -270,10 +270,15 @@ def looks_like_chat(message):
 
 
 def find_matches(query):
+    """Match only exact saved titles or meaningful title substrings.
+
+    Deliberately avoids fuzzy matching: ordinary words should never accidentally
+    trigger an anime result just because they resemble a saved title.
+    """
     anime = load_anime()
     normalized_query = normalize(query)
 
-    if not normalized_query:
+    if len(normalized_query) < 3:
         return [], []
 
     exact = []
@@ -285,30 +290,18 @@ def find_matches(query):
 
         if normalized_query == title or normalized_query == button:
             exact.append(item)
-        elif (
-            normalized_query in title
-            or normalized_query in button
-            or title in normalized_query
-        ):
+            continue
+
+        # Accept a meaningful part of the saved title, e.g. "naru" or
+        # "shippuden", but reject tiny fragments such as "a" or "on".
+        if (normalized_query in title or normalized_query in button):
             partial.append(item)
 
     if exact:
         return exact, []
-
     if partial:
         return partial[:10], []
-
-    names = [normalize(item["search_name"]) for item in anime]
-    close = get_close_matches(normalized_query, names, n=5, cutoff=0.65)
-
-    suggestions = []
-    for name in close:
-        for item in anime:
-            if normalize(item["search_name"]) == name:
-                suggestions.append(item)
-                break
-
-    return [], suggestions
+    return [], []
 
 
 def random_anime_suggestions(context, exclude_names=None, limit=5):
@@ -508,6 +501,10 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("admin_action") and is_admin(user.id):
         return
 
+    # Ignore greetings and ordinary conversation before searching.
+    if looks_like_chat(query):
+        return
+
     # Preserve the existing group behavior: only matching anime trigger a reply;
     # unrelated or unrecognized group conversation stays silent.
     if message.chat.type in ("group", "supergroup"):
@@ -521,30 +518,9 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_anime_result(update, exact_or_partial[0], context)
         return
 
-    # Editable no-result text, followed by random inline buttons that open
-    # each suggested anime's own download URL. Keep suggestions out of the text.
-    no_result_text = settings.get(
-        "no_anime_text", DEFAULT_SETTINGS["no_anime_text"]
-    )
-    no_result_text = render_template(no_result_text, query=query)
-
-    suggestions = random_anime_suggestions(context, limit=5)
-    suggestion_keyboard = None
-    if suggestions:
-        suggestion_rows = [
-            [InlineKeyboardButton(
-                f"🎬 {item['button_name']}"[:64],
-                url=item["url"],
-            )]
-            for item in suggestions
-        ]
-        suggestion_keyboard = InlineKeyboardMarkup(suggestion_rows)
-
-    await message.reply_text(
-        no_result_text,
-        reply_markup=suggestion_keyboard,
-        disable_web_page_preview=True,
-    )
+    # Unmatched text is ordinary conversation or an unknown title: stay silent.
+    # This prevents unrelated messages from producing false anime suggestions.
+    return
 
 
 # =========================
