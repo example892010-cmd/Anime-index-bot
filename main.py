@@ -270,37 +270,61 @@ def looks_like_chat(message):
 
 
 def find_matches(query):
-    """Match only exact saved titles or meaningful title substrings.
+    """Find saved anime titles inside a message, including small spelling mistakes.
 
-    Deliberately avoids fuzzy matching: ordinary words should never accidentally
-    trigger an anime result just because they resemble a saved title.
+    Examples: "Naruto tamil", "I want Naruto", and "knosuba tamil".
+    Matching is title-token based so unrelated chat words do not trigger results.
     """
     anime = load_anime()
     normalized_query = normalize(query)
+    query_tokens = [word for word in normalized_query.split() if len(word) >= 4]
 
-    if len(normalized_query) < 3:
+    if not query_tokens:
         return [], []
 
     exact = []
-    partial = []
+    contained = []
+    typo_matches = []
 
     for item in anime:
         title = normalize(item["search_name"])
         button = normalize(item["button_name"])
+        title_text = f"{title} {button}"
+        title_tokens = list(dict.fromkeys(
+            word for word in title_text.split() if len(word) >= 4
+        ))
 
-        if normalized_query == title or normalized_query == button:
+        # Exact saved title anywhere in the message, even with extra words.
+        if title and (title in normalized_query or button in normalized_query):
             exact.append(item)
             continue
 
-        # Accept a meaningful part of the saved title, e.g. "naru" or
-        # "shippuden", but reject tiny fragments such as "a" or "on".
-        if (normalized_query in title or normalized_query in button):
-            partial.append(item)
+        # Exact meaningful word contained in the saved title or message.
+        if any(token in title_tokens for token in query_tokens):
+            contained.append(item)
+            continue
+
+        # Allow a small typo in a meaningful title word (e.g. knosuba -> konosuba).
+        typo_found = False
+        for query_word in query_tokens:
+            if len(query_word) < 5:
+                continue
+            if any(
+                len(title_word) >= 5
+                and get_close_matches(query_word, [title_word], n=1, cutoff=0.78)
+                for title_word in title_tokens
+            ):
+                typo_found = True
+                break
+        if typo_found:
+            typo_matches.append(item)
 
     if exact:
         return exact, []
-    if partial:
-        return partial[:10], []
+    if contained:
+        return contained[:10], []
+    if typo_matches:
+        return typo_matches[:5], []
     return [], []
 
 
@@ -501,21 +525,18 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("admin_action") and is_admin(user.id):
         return
 
-    # Ignore greetings and ordinary conversation before searching.
-    if looks_like_chat(query):
-        return
-
-    # Preserve the existing group behavior: only matching anime trigger a reply;
-    # unrelated or unrecognized group conversation stays silent.
-    if message.chat.type in ("group", "supergroup"):
-        exact_or_partial, _suggestions = find_matches(query)
-        if exact_or_partial:
-            await send_anime_result(update, exact_or_partial[0], context)
-        return
-
+    # Search first: a title inside a longer message ("hi, Naruto please")
+    # must still work. Ordinary chat without a title remains ignored.
     exact_or_partial, _suggestions = find_matches(query)
     if exact_or_partial:
         await send_anime_result(update, exact_or_partial[0], context)
+        return
+
+    if looks_like_chat(query):
+        return
+
+    # Preserve the existing behaviour: unknown group/private text stays silent.
+    if message.chat.type in ("group", "supergroup"):
         return
 
     # Unmatched text is ordinary conversation or an unknown title: stay silent.
