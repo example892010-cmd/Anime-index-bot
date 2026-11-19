@@ -383,6 +383,53 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+async def is_group_admin(bot, chat_id, user_id):
+    """Return True only when the sender is an administrator of this group."""
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        logger.exception("Could not verify group administrator status")
+        return False
+
+
+async def send_next_poster_title(message, context):
+    """Send the next title in the current group's poster-collection session."""
+    session = context.chat_data.get("poster_collection")
+    if not session:
+        return
+
+    items = session.get("items", [])
+    index = int(session.get("index", 0))
+    posters = settings.setdefault("posters", {})
+
+    # Skip any title that already received an individual poster while this
+    # collection session was active.
+    while index < len(items):
+        item = items[index]
+        key = item["poster_key"]
+        if not posters.get(key):
+            session["index"] = index
+            await message.reply_text(item["button_name"])
+            return
+        index += 1
+
+    # Finished. Do not send a completion message: the workflow stays title-only.
+    context.chat_data.pop("poster_collection", None)
+
+
+async def poster_session_admin(update, context):
+    """Check that the current sender owns the active session and is a group admin."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return False
+    session = context.chat_data.get("poster_collection")
+    if not session or session.get("user_id") != user.id:
+        return False
+    return await is_group_admin(context.bot, message.chat_id, user.id)
+
+
 def mark_as_admin_input(context, message):
     # Prevent a completed admin command from also being treated as an anime search.
     context.user_data["skip_search_message_id"] = message.message_id
@@ -515,7 +562,7 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # The admin text handler marks a consumed message so this handler does not
-    # accidentally process it as a public anime search.
+    # accidentally process it as an anime search.
     if context.user_data.get("skip_search_message_id") == message.message_id:
         context.user_data.pop("skip_search_message_id", None)
         return
@@ -595,7 +642,84 @@ def main_admin_keyboard():
             InlineKeyboardButton("❌ No Anime Message", callback_data="admin_no_anime_text"),
         ],
         [InlineKeyboardButton("⏱ Set Expiry", callback_data="admin_expiry")],
+        [InlineKeyboardButton("➕ Add Groups", callback_data="admin_add_groups")],
     ])
+
+
+async def add_posters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start a title-by-title poster collection in the current group."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply_text("Use /addposters inside the group where you want to collect posters.")
+        return
+
+    if not await is_group_admin(context.bot, message.chat_id, user.id):
+        await message.reply_text("Only a group administrator can start poster collection.")
+        return
+
+    existing = context.chat_data.get("poster_collection")
+    if existing:
+        # Keep the active session intact; show only its current title.
+        items = existing.get("items", [])
+        index = int(existing.get("index", 0))
+        if index < len(items):
+            await message.reply_text(items[index]["button_name"])
+        return
+
+    anime = load_anime()
+    posters = settings.setdefault("posters", {})
+    items = []
+    seen = set()
+
+    for item in anime:
+        poster_key = normalize(item["search_name"])
+        if not poster_key or poster_key in seen:
+            continue
+        seen.add(poster_key)
+        if posters.get(poster_key):
+            continue
+        items.append({
+            "button_name": item["button_name"],
+            "poster_key": poster_key,
+        })
+
+    if not items:
+        await message.reply_text("All anime entries already have individual posters.")
+        return
+
+    context.chat_data["poster_collection"] = {
+        "user_id": user.id,
+        "items": items,
+        "index": 0,
+    }
+    await send_next_poster_title(message, context)
+
+
+async def skip_poster(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skip the current title and send the next title, without extra text."""
+    message = update.effective_message
+    if not message or message.chat.type not in ("group", "supergroup"):
+        return
+    if not await poster_session_admin(update, context):
+        return
+
+    session = context.chat_data.get("poster_collection")
+    session["index"] = int(session.get("index", 0)) + 1
+    await send_next_poster_title(message, context)
+
+
+async def cancel_posters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the current poster collection silently."""
+    message = update.effective_message
+    if not message or message.chat.type not in ("group", "supergroup"):
+        return
+    if not await poster_session_admin(update, context):
+        return
+    context.chat_data.pop("poster_collection", None)
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,6 +756,24 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "⚙️ ANIFLIX ADMIN PANEL\n\nChoose an action:",
             reply_markup=main_admin_keyboard(),
+        )
+        return
+
+    if action == "admin_add_groups":
+        bot = await context.bot.get_me()
+        if not bot.username:
+            await query.message.reply_text("Could not get the bot username. Please try again later.")
+            return
+        add_group_url = f"https://t.me/{bot.username}?startgroup=true"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Add ANIFLIX to a Group", url=add_group_url)
+        ]])
+        await query.message.reply_text(
+            "➕ ADD ANIFLIX TO GROUPS\n\n"
+            "Use the button below and choose a group. A group administrator must confirm adding the bot.\n\n"
+            "After adding it, promote the bot to administrator so it can receive group messages and poster photos.\n\n"
+            "Note: Telegram does not allow bots to join a group automatically from an invite link.",
+            reply_markup=keyboard,
         )
         return
 
@@ -901,7 +1043,33 @@ async def process_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     user = update.effective_user
 
-    if not message or not message.photo or not user or not is_admin(user.id):
+    if not message or not message.photo or not user:
+        return
+
+    # Group poster collection takes priority over the existing private admin
+    # poster tools. The caption is intentionally ignored.
+    if message.chat.type in ("group", "supergroup"):
+        session = context.chat_data.get("poster_collection")
+        if session and session.get("user_id") == user.id:
+            if not await is_group_admin(context.bot, message.chat_id, user.id):
+                return
+
+            items = session.get("items", [])
+            index = int(session.get("index", 0))
+            if index >= len(items):
+                context.chat_data.pop("poster_collection", None)
+                return
+
+            item = items[index]
+            poster_key = item["poster_key"]
+            settings.setdefault("posters", {})[poster_key] = message.photo[-1].file_id
+            save_settings()
+            session["index"] = index + 1
+            await send_next_poster_title(message, context)
+            return
+
+    # The remaining poster-setting actions are reserved for configured bot admins.
+    if not is_admin(user.id):
         return
 
     action = context.user_data.get("admin_action")
@@ -1004,6 +1172,9 @@ def main():
     application.add_handler(CommandHandler("list", show_list))
     application.add_handler(CommandHandler("trending", trending))
     application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("addposters", add_posters))
+    application.add_handler(CommandHandler("skipposter", skip_poster))
+    application.add_handler(CommandHandler("cancelposters", cancel_posters))
 
     application.add_handler(CallbackQueryHandler(admin_buttons))
 
