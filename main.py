@@ -1,24 +1,30 @@
-import os
-import re
+import asyncio
+import html
 import json
-import random
 import logging
+import os
+import random
+import re
+import secrets
+import shutil
 import threading
+import time
 from copy import deepcopy
-from difflib import get_close_matches
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
 from flask import Flask, jsonify
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    Defaults,
+    MessageHandler,
     filters,
 )
 
@@ -27,7 +33,6 @@ from telegram.ext import (
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
 ADMIN_IDS = {
     int(item.strip())
     for item in os.getenv("ADMIN_IDS", "").split(",")
@@ -36,25 +41,130 @@ ADMIN_IDS = {
 
 ONGOING_URL = "https://t.me/+cVwTJSgsEvUzNWZl"
 SUPPORT_URL = "https://t.me/+4YfcdPoSdK9jYmVl"
+ACCESS_SECONDS = 6 * 60 * 60
+LIST_DELETE_SECONDS = 10 * 60
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+# Use the configured persistent data directory when available. The original
+# bot stored anime_db.txt / anime_settings.json in DATA_DIR (default: cwd),
+# while the original Render blueprint exposed DB_PATH=/var/data/anime.db.
+# The directory is now resolved safely without changing either file format.
+if os.getenv("DATA_DIR"):
+    DATA_DIR = Path(os.environ["DATA_DIR"]).expanduser()
+elif os.getenv("DB_PATH"):
+    DATA_DIR = Path(os.environ["DB_PATH"]).expanduser().parent
+else:
+    DATA_DIR = Path(".").expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_FILE = DATA_DIR / "anime_db.txt"
 SETTINGS_FILE = DATA_DIR / "anime_settings.json"
+
+
+def migrate_legacy_data_files():
+    """Preserve files from the old cwd location when moving to a mounted disk."""
+    legacy_dir = Path(".").resolve()
+    try:
+        if DATA_DIR.resolve() == legacy_dir:
+            return
+    except OSError:
+        return
+
+    legacy_db = legacy_dir / "anime_db.txt"
+    legacy_settings = legacy_dir / "anime_settings.json"
+
+    if legacy_db.exists():
+        try:
+            if not DB_FILE.exists() or (DB_FILE.stat().st_size == 0 and legacy_db.stat().st_size > 0):
+                shutil.copy2(legacy_db, DB_FILE)
+            elif DB_FILE.exists() and legacy_db.stat().st_size > 0:
+                # Keep every distinct anime row from both locations. Existing
+                # persistent-disk rows remain first and are never overwritten.
+                current_lines = DB_FILE.read_text(encoding="utf-8").splitlines()
+                incoming_lines = legacy_db.read_text(encoding="utf-8").splitlines()
+
+                def row_key(line):
+                    parts = [part.strip() for part in line.split(" - ")]
+                    if len(parts) >= 5:
+                        raw_name = " - ".join(parts[4:])
+                    elif len(parts) == 3:
+                        raw_name = parts[2]
+                    else:
+                        raw_name = line
+                    return re.sub(r"[^a-z0-9\s]", " ", raw_name.lower()).strip()
+
+                seen = {row_key(line) for line in current_lines if row_key(line)}
+                for line in incoming_lines:
+                    key = row_key(line)
+                    if key and key not in seen:
+                        current_lines.append(line)
+                        seen.add(key)
+                DB_FILE.write_text("\n".join(current_lines) + ("\n" if current_lines else ""), encoding="utf-8")
+        except OSError:
+            logging.exception("Could not migrate legacy anime database; source was left untouched")
+
+    if legacy_settings.exists():
+        try:
+            old_data = json.loads(legacy_settings.read_text(encoding="utf-8"))
+            if not SETTINGS_FILE.exists() or SETTINGS_FILE.stat().st_size == 0:
+                shutil.copy2(legacy_settings, SETTINGS_FILE)
+            else:
+                new_data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+                if isinstance(old_data, dict) and isinstance(new_data, dict):
+                    merged = dict(old_data)
+                    merged.update(new_data)  # persistent-disk scalar values win
+                    for key in ("posters", "search_counts", "anime_button_colors", "verification_links", "user_access", "request_dedupe"):
+                        old_map = old_data.get(key, {}) if isinstance(old_data.get(key), dict) else {}
+                        new_map = new_data.get(key, {}) if isinstance(new_data.get(key), dict) else {}
+                        combined = dict(old_map)
+                        for map_key, map_value in new_map.items():
+                            if key in {"search_counts", "request_dedupe", "user_access"} and map_key in combined:
+                                try:
+                                    combined[map_key] = max(float(combined[map_key]), float(map_value))
+                                except (TypeError, ValueError):
+                                    combined[map_key] = map_value
+                            else:
+                                combined[map_key] = map_value
+                        merged[key] = combined
+                    merged["registered_users"] = list(dict.fromkeys(
+                        list(old_data.get("registered_users", [])) + list(new_data.get("registered_users", []))
+                    ))
+                    for key in ("random_posters", "pending_requests", "pending_list_deletions"):
+                        values = []
+                        seen_values = set()
+                        for item in list(old_data.get(key, []) or []) + list(new_data.get(key, []) or []):
+                            marker = item.get("id") if isinstance(item, dict) else json.dumps(item, sort_keys=True, ensure_ascii=False)
+                            if marker not in seen_values:
+                                values.append(item)
+                                seen_values.add(marker)
+                            elif key == "pending_requests" and isinstance(item, dict):
+                                for existing in values:
+                                    if isinstance(existing, dict) and existing.get("id") == item.get("id"):
+                                        existing["sent_to"] = sorted(set(existing.get("sent_to", [])) | set(item.get("sent_to", [])))
+                                        break
+                        merged[key] = values
+                    temp = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + ".migrate.tmp")
+                    temp.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+                    temp.replace(SETTINGS_FILE)
+        except (OSError, json.JSONDecodeError, TypeError):
+            logging.exception("Could not merge legacy settings; source was left untouched")
+
+
+migrate_legacy_data_files()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("aniflix_index_bot")
 
 # =========================
-# FLASK SERVER FOR RENDER
+# FLASK HEALTH SERVER
 # =========================
 
 web = Flask(__name__)
+# The original Render blueprint used `main:app`; keep the alias for any older
+# deployment configuration, although the supplied Render command uses python.
+app = web
 
 
 @web.route("/")
@@ -69,15 +179,10 @@ def health():
 
 def run_web_server():
     port = int(os.environ.get("PORT", "10000"))
-    web.run(
-        host="0.0.0.0",
-        port=port,
-        use_reloader=False,
-    )
-
+    web.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # =========================
-# LOCAL DATA
+# DEFAULT SETTINGS + STORAGE
 # =========================
 
 DEFAULT_SETTINGS = {
@@ -97,14 +202,31 @@ DEFAULT_SETTINGS = {
         "Powered By: @ANIFLIXANIMETAMIL"
     ),
     "no_anime_text": (
-        "❌ No Anime Found!\n\n"
-        "Check the spelling or use /list to see available anime."
+        "❌ NO ANIME FOUND\n\n"
+        "The anime you searched for is not available.\n"
+        "You can request it using the button below."
     ),
     "global_poster": "",
     "poster_mode": "global",
     "random_posters": [],
     "posters": {},
     "search_counts": {},
+    "default_button_color": "green",
+    "anime_button_colors": {},
+    "registered_users": [],
+    "verification_enabled": False,
+    "verification_links": {},
+    "latest_verification_token": "",
+    "user_access": {},
+    "verify_post_text": (
+        "🍥 ANIFLIX ANIME INDEX BOT TAMIL\n\n"
+        "Welcome! Tap VERIFY NOW to unlock private anime search for 6 hours."
+    ),
+    "verify_post_photo": "",
+    "verify_button_text": "🟢 VERIFY NOW",
+    "request_dedupe": {},
+    "pending_requests": [],
+    "pending_list_deletions": [],
 }
 
 
@@ -112,32 +234,44 @@ def load_settings():
     if SETTINGS_FILE.exists():
         try:
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            settings_data = deepcopy(DEFAULT_SETTINGS)
+            data = deepcopy(DEFAULT_SETTINGS)
             if isinstance(saved, dict):
-                settings_data.update(saved)
-            # Repair older or malformed settings without discarding saved values.
-            # Upgrade the previous built-in default template to include genre/rating,
-            # but preserve any custom template the admin already created.
+                data.update(saved)
+
             old_default_post_text = (
                 "🍥 {anime}\n\n"
                 "🎧 Audio: Tamil Audio\n"
                 "📥 Click the button below to get your anime.\n\n"
                 "Powered By: @ANIFLIXANIMETAMIL"
             )
-            if settings_data.get("post_text") == old_default_post_text:
-                settings_data["post_text"] = DEFAULT_SETTINGS["post_text"]
-            if not isinstance(settings_data.get("posters"), dict):
-                settings_data["posters"] = {}
-            if not isinstance(settings_data.get("random_posters"), list):
-                settings_data["random_posters"] = []
-            if settings_data.get("poster_mode") not in {"global", "random"}:
-                settings_data["poster_mode"] = "global"
-            if not isinstance(settings_data.get("search_counts"), dict):
-                settings_data["search_counts"] = {}
-            return settings_data
-        except (json.JSONDecodeError, OSError):
-            logger.exception("Could not load settings")
+            if data.get("post_text") == old_default_post_text:
+                data["post_text"] = DEFAULT_SETTINGS["post_text"]
 
+            expected_types = {
+                "posters": dict,
+                "random_posters": list,
+                "search_counts": dict,
+                "anime_button_colors": dict,
+                "registered_users": list,
+                "verification_links": dict,
+                "user_access": dict,
+                "request_dedupe": dict,
+                "pending_requests": list,
+                "pending_list_deletions": list,
+            }
+            for key, expected in expected_types.items():
+                if not isinstance(data.get(key), expected):
+                    data[key] = deepcopy(DEFAULT_SETTINGS[key])
+
+            if data.get("poster_mode") not in {"global", "random"}:
+                data["poster_mode"] = "global"
+            if data.get("default_button_color") not in {"red", "blue", "green"}:
+                data["default_button_color"] = "green"
+            if not isinstance(data.get("verification_enabled"), bool):
+                data["verification_enabled"] = False
+            return data
+        except (json.JSONDecodeError, OSError):
+            logger.exception("Could not load anime settings; using safe defaults")
     return deepcopy(DEFAULT_SETTINGS)
 
 
@@ -145,458 +279,27 @@ settings = load_settings()
 
 
 def save_settings():
-    SETTINGS_FILE.write_text(
+    """Atomically save settings so a partial write cannot corrupt the JSON file."""
+    temp_file = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + ".tmp")
+    temp_file.write_text(
         json.dumps(settings, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    temp_file.replace(SETTINGS_FILE)
 
 
-def load_anime():
-    anime = []
+def normalize(value):
+    value = str(value or "").lower().strip()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    return " ".join(value.split())
 
-    if not DB_FILE.exists():
-        DB_FILE.write_text("", encoding="utf-8")
-        return anime
 
-    for line in DB_FILE.read_text(encoding="utf-8").splitlines():
-        # New format: BUTTON NAME - URL - GENRE - RATING - SEARCH NAME
-        # Legacy 3-field lines are still accepted to protect existing data.
-        parts = [part.strip() for part in line.split(" - ")]
+def aliases_for(search_name):
+    """The Search Name field is authoritative; comma-separated aliases are allowed."""
+    return [normalize(part) for part in str(search_name or "").split(",") if normalize(part)]
 
-        if len(parts) >= 5:
-            button_name, url, genre, rating = parts[:4]
-            search_name = " - ".join(parts[4:]).strip()
-        elif len(parts) == 3:
-            button_name, url, search_name = parts
-            genre, rating = "Not specified", "N/A"
-        else:
-            continue
-
-        if button_name and url.startswith(("https://", "http://")) and search_name:
-            anime.append({
-                "button_name": button_name,
-                "url": url,
-                "genre": genre or "Not specified",
-                "rating": rating or "N/A",
-                "search_name": search_name,
-            })
-
-    return anime
-
-
-def save_anime(anime):
-    lines = [
-        f"{item['button_name']} - {item['url']} - {item.get('genre', 'Not specified')} - {item.get('rating', 'N/A')} - {item['search_name']}"
-        for item in anime
-    ]
-    DB_FILE.write_text(
-        "\n".join(lines) + ("\n" if lines else ""),
-        encoding="utf-8",
-    )
-
-
-# =========================
-# SEARCH HELPERS
-# =========================
-
-def normalize(text):
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return " ".join(text.split())
-
-
-# Messages containing these phrases are normally conversations,
-# not anime searches. Add more phrases here if needed.
-CHAT_PHRASES = {
-    "how are you",
-    "how r u",
-    "what are you doing",
-    "what r u doing",
-    "good morning",
-    "good night",
-    "good evening",
-    "good afternoon",
-    "thank you",
-    "thanks",
-    "welcome",
-    "hello",
-    "hi",
-    "hey",
-    "bro",
-    "guys",
-    "when will the update come",
-    "when is the next update",
-    "any updates",
-    "what happened",
-    "join now",
-    "who are you",
-    "are you there",
-    "ok",
-    "okay",
-    "yes",
-    "no",
-    "super",
-    "nice",
-}
-
-
-def looks_like_chat(message):
-    query = normalize(message)
-
-    if not query:
-        return True
-
-    if query in CHAT_PHRASES:
-        return True
-
-    words = query.split()
-
-    if words[0] in {
-        "hello", "hi", "hey", "thanks", "thank",
-        "good", "bro", "guys", "dei", "machan",
-    }:
-        return True
-
-    question_starters = {
-        "how", "when", "where", "why", "who",
-        "what", "is", "are", "can", "will",
-        "did", "do", "does", "should", "any",
-    }
-
-    if words[0] in question_starters:
-        return True
-
-    return False
-
-
-def find_matches(query):
-    """Find saved anime titles inside a message, including small spelling mistakes.
-
-    Examples: "Naruto tamil", "I want Naruto", and "knosuba tamil".
-    Matching is title-token based so unrelated chat words do not trigger results.
-    """
-    anime = load_anime()
-    normalized_query = normalize(query)
-    query_tokens = [word for word in normalized_query.split() if len(word) >= 4]
-
-    if not query_tokens:
-        return [], []
-
-    exact = []
-    contained = []
-    typo_matches = []
-
-    for item in anime:
-        title = normalize(item["search_name"])
-        button = normalize(item["button_name"])
-        title_text = f"{title} {button}"
-        title_tokens = list(dict.fromkeys(
-            word for word in title_text.split() if len(word) >= 4
-        ))
-
-        # Exact saved title anywhere in the message, even with extra words.
-        if title and (title in normalized_query or button in normalized_query):
-            exact.append(item)
-            continue
-
-        # Exact meaningful word contained in the saved title or message.
-        if any(token in title_tokens for token in query_tokens):
-            contained.append(item)
-            continue
-
-        # Allow a small typo in a meaningful title word (e.g. knosuba -> konosuba).
-        typo_found = False
-        for query_word in query_tokens:
-            if len(query_word) < 5:
-                continue
-            if any(
-                len(title_word) >= 5
-                and get_close_matches(query_word, [title_word], n=1, cutoff=0.78)
-                for title_word in title_tokens
-            ):
-                typo_found = True
-                break
-        if typo_found:
-            typo_matches.append(item)
-
-    if exact:
-        return exact, []
-    if contained:
-        return contained[:10], []
-    if typo_matches:
-        return typo_matches[:5], []
-    return [], []
-
-
-def random_anime_suggestions(context, exclude_names=None, limit=5):
-    """Choose varied suggestions, avoiding the user's most recent suggestions."""
-    anime = load_anime()
-    if not anime:
-        return []
-
-    excluded = set(exclude_names or [])
-    recent = context.user_data.get("recent_suggestions", [])
-    candidates = [
-        item for item in anime
-        if normalize(item["search_name"]) not in excluded
-        and normalize(item["search_name"]) not in recent
-    ]
-
-    # If the recent-history filter leaves too few choices, relax it but still
-    # avoid duplicates in the current suggestion list.
-    if len(candidates) < min(limit, len(anime)):
-        candidates = [
-            item for item in anime
-            if normalize(item["search_name"]) not in excluded
-        ]
-
-    chosen = random.sample(candidates, k=min(limit, len(candidates)))
-    context.user_data["recent_suggestions"] = [
-        normalize(item["search_name"]) for item in chosen
-    ]
-    return chosen
-
-
-def add_search_count(item):
-    counts = settings.setdefault("search_counts", {})
-    key = normalize(item["search_name"])
-    try:
-        counts[key] = int(counts.get(key, 0)) + 1
-    except (TypeError, ValueError):
-        counts[key] = 1
-    save_settings()
-
-
-def render_template(template, **values):
-    """Replace supported placeholders without interpreting arbitrary braces."""
-    result = str(template)
-    for key, value in values.items():
-        result = result.replace("{" + key + "}", str(value))
-    return result
-
-
-# =========================
-# TELEGRAM HELPERS
-# =========================
-
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-
-async def is_group_admin(bot, chat_id, user_id):
-    """Return True only when the sender is an administrator of this group."""
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        logger.exception("Could not verify group administrator status")
-        return False
-
-
-async def send_next_poster_title(message, context):
-    """Send the next title in the current group's poster-collection session."""
-    session = context.chat_data.get("poster_collection")
-    if not session:
-        return
-
-    items = session.get("items", [])
-    index = int(session.get("index", 0))
-    posters = settings.setdefault("posters", {})
-
-    # Skip any title that already received an individual poster while this
-    # collection session was active.
-    while index < len(items):
-        item = items[index]
-        key = item["poster_key"]
-        if not posters.get(key):
-            session["index"] = index
-            await message.reply_text(item["button_name"])
-            return
-        index += 1
-
-    # Finished. Do not send a completion message: the workflow stays title-only.
-    context.chat_data.pop("poster_collection", None)
-
-
-async def poster_session_admin(update, context):
-    """Check that the current sender owns the active session and is a group admin."""
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user:
-        return False
-    session = context.chat_data.get("poster_collection")
-    if not session or session.get("user_id") != user.id:
-        return False
-    return await is_group_admin(context.bot, message.chat_id, user.id)
-
-
-def mark_as_admin_input(context, message):
-    # Prevent a completed admin command from also being treated as an anime search.
-    context.user_data["skip_search_message_id"] = message.message_id
-
-
-def welcome_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ONGOING ANIME", url=ONGOING_URL)],
-        [InlineKeyboardButton("SUPPORT GROUP", url=SUPPORT_URL)],
-    ])
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = settings.get("welcome_text", DEFAULT_SETTINGS["welcome_text"])
-    if update.message:
-        await update.message.reply_text(text, reply_markup=welcome_keyboard())
-
-
-async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    anime = load_anime()
-
-    if not anime:
-        await update.effective_message.reply_text("The anime list is currently empty.")
-        return
-
-    lines = ["🍥 ANIFLIX ANIME INDEX TAMIL 🍥", ""]
-    for index, item in enumerate(anime, start=1):
-        lines.append(f"{index}. {item['button_name']}")
-
-    message = ""
-    for line in lines:
-        if len(message) + len(line) + 1 > 3800:
-            await update.effective_message.reply_text(message)
-            message = ""
-        message += line + "\n"
-
-    if message:
-        await update.effective_message.reply_text(message)
-
-
-async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    counts = settings.get("search_counts", {})
-    anime = load_anime()
-    by_name = {normalize(item["search_name"]): item for item in anime}
-
-    ranked = []
-    for key, count in counts.items():
-        try:
-            number = int(count)
-        except (TypeError, ValueError):
-            continue
-        item = by_name.get(normalize(key))
-        if item and number > 0:
-            ranked.append((number, item))
-
-    ranked.sort(key=lambda pair: pair[0], reverse=True)
-
-    if not ranked:
-        await update.effective_message.reply_text(
-            "📈 TRENDING ANIME SEARCHES\n\nNo searches have been recorded yet. Search for an anime to start the rankings!"
-        )
-        return
-
-    lines = ["📈 TRENDING ANIME SEARCHES", "", "Most searched anime on ANIFLIX:", ""]
-    for rank, (count, item) in enumerate(ranked[:10], start=1):
-        lines.append(f"{rank}. {item['button_name']} — {count} searches")
-
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def send_anime_result(
-    update: Update,
-    item,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    # Count successful searches so /trending is based on real user searches.
-    add_search_count(item)
-
-    text = settings.get("post_text", DEFAULT_SETTINGS["post_text"])
-    text = render_template(
-        text,
-        anime=item["button_name"],
-        link=item["url"],
-        bot_title="ANIFLIX ANIME INDEX BOT TAMIL",
-        expiry=settings.get("expiry_minutes", 10),
-        genre=item.get("genre", "Not specified"),
-        rating=item.get("rating", "N/A"),
-    )
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📥 DOWNLOAD NOW", url=item["url"])
-    ]])
-
-    # Priority: title-specific poster, then random poster pool, then one global poster.
-    poster = settings.get("posters", {}).get(
-        normalize(item["search_name"]), ""
-    )
-    random_posters = settings.get("random_posters", [])
-    if not poster and settings.get("poster_mode", "global") == "random" and random_posters:
-        poster = random.choice(random_posters)
-    if not poster:
-        poster = settings.get("global_poster", "")
-
-    if poster:
-        try:
-            await update.effective_message.reply_photo(
-                photo=poster,
-                caption=text,
-                reply_markup=keyboard,
-            )
-            return
-        except Exception:
-            logger.exception("Could not send poster; sending text instead")
-
-    await update.effective_message.reply_text(
-        text,
-        reply_markup=keyboard,
-        disable_web_page_preview=True,
-    )
-
-
-async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    user = update.effective_user
-
-    if not message or not message.text or not user:
-        return
-
-    if message.text.startswith("/"):
-        return
-
-    # The admin text handler marks a consumed message so this handler does not
-    # accidentally process it as an anime search.
-    if context.user_data.get("skip_search_message_id") == message.message_id:
-        context.user_data.pop("skip_search_message_id", None)
-        return
-
-    query = message.text.strip()
-
-    if context.user_data.get("admin_action") and is_admin(user.id):
-        return
-
-    # Search first: a title inside a longer message ("hi, Naruto please")
-    # must still work. Ordinary chat without a title remains ignored.
-    exact_or_partial, _suggestions = find_matches(query)
-    if exact_or_partial:
-        await send_anime_result(update, exact_or_partial[0], context)
-        return
-
-    if looks_like_chat(query):
-        return
-
-    # Preserve the existing behaviour: unknown group/private text stays silent.
-    if message.chat.type in ("group", "supergroup"):
-        return
-
-    # Unmatched text is ordinary conversation or an unknown title: stay silent.
-    # This prevents unrelated messages from producing false anime suggestions.
-    return
-
-
-# =========================
-# ANIME ENTRY PARSER
-# =========================
 
 def parse_anime_entry(line):
-    """Parse the current 5-field format, while accepting legacy 3-field lines."""
     parts = [part.strip() for part in line.split(" - ")]
     if len(parts) >= 5:
         button_name, url, genre, rating = parts[:4]
@@ -618,173 +321,1033 @@ def parse_anime_entry(line):
     }
 
 
+def load_anime():
+    if not DB_FILE.exists():
+        DB_FILE.write_text("", encoding="utf-8")
+        return []
+
+    anime = []
+    for line in DB_FILE.read_text(encoding="utf-8").splitlines():
+        item = parse_anime_entry(line)
+        if item:
+            anime.append(item)
+    return anime
+
+
+def save_anime(anime):
+    lines = [
+        f"{item['button_name']} - {item['url']} - {item.get('genre', 'Not specified')} - "
+        f"{item.get('rating', 'N/A')} - {item['search_name']}"
+        for item in anime
+    ]
+    DB_FILE.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
 # =========================
-# ADMIN PANEL
+# TEXT / TELEGRAM HELPERS
+# =========================
+
+
+def bold_text(value):
+    """Escape user-controlled text and display every bot message in bold HTML."""
+    return "<b>" + html.escape(str(value), quote=False) + "</b>"
+
+
+async def reply_bold(message, text, **kwargs):
+    return await message.reply_text(bold_text(text), **kwargs)
+
+
+async def send_bold(bot, chat_id, text, **kwargs):
+    return await bot.send_message(chat_id=chat_id, text=bold_text(text), **kwargs)
+
+
+def is_admin(user_id):
+    return bool(user_id and user_id in ADMIN_IDS)
+
+
+def mark_as_admin_input(context, message):
+    context.user_data["skip_search_message_id"] = message.message_id
+
+
+def welcome_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("ONGOING ANIME", url=ONGOING_URL, style="primary")],
+        [InlineKeyboardButton("SUPPORT GROUP", url=SUPPORT_URL, style="primary")],
+    ])
+
+
+def register_private_user(user):
+    users = settings.setdefault("registered_users", [])
+    uid = int(user.id)
+    existing = {int(value) for value in users if str(value).isdigit()}
+    if uid not in existing:
+        users.append(uid)
+        save_settings()
+
+
+def private_access_is_valid(user_id):
+    if not settings.get("verification_enabled", False):
+        return True
+    raw_expiry = settings.get("user_access", {}).get(str(user_id))
+    try:
+        return float(raw_expiry) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def format_ist(timestamp):
+    value = float(timestamp)
+    try:
+        local_zone = ZoneInfo("Asia/Kolkata")
+    except Exception:
+        # India has no daylight-saving change; this fallback works on minimal
+        # Python images where the operating-system timezone database is absent.
+        local_zone = timezone(timedelta(hours=5, minutes=30))
+    return datetime.fromtimestamp(value, local_zone).strftime("%d %b %Y, %I:%M %p IST")
+
+
+async def deliver_pending_requests_to_admin(bot, admin_id):
+    """Retry request notifications after an admin has opened the bot in PM."""
+    pending = settings.setdefault("pending_requests", [])
+    remaining = []
+    changed = False
+    for record in pending:
+        sent_to = {int(value) for value in record.get("sent_to", []) if str(value).isdigit()}
+        if int(admin_id) in sent_to:
+            remaining.append(record)
+            continue
+        try:
+            await send_bold(bot, int(admin_id), record.get("text", "📩 NEW ANIME REQUEST"))
+            sent_to.add(int(admin_id))
+            record["sent_to"] = sorted(sent_to)
+            changed = True
+        except Exception:
+            remaining.append(record)
+            continue
+        if not set(ADMIN_IDS).issubset(sent_to):
+            remaining.append(record)
+    if changed or len(remaining) != len(pending):
+        settings["pending_requests"] = remaining
+        save_settings()
+
+
+def verification_keyboard():
+    token = settings.get("latest_verification_token", "")
+    if not token or token not in settings.get("verification_links", {}):
+        return None
+    # The username is inserted later by send_verification_post.
+    return token
+
+
+async def send_verification_post(message, context, expired=False):
+    text = settings.get("verify_post_text", DEFAULT_SETTINGS["verify_post_text"])
+    if expired:
+        text = "⏰ ACCESS EXPIRED\n\nYour 6-hour access to ANIFLIX Anime Index Bot has expired. Open the verification link below to activate another 6-hour session.\n\n" + text
+
+    token = verification_keyboard()
+    markup = None
+    if token:
+        me = await context.bot.get_me()
+        link = f"https://t.me/{me.username}?start=verify_{token}"
+        label = settings.get("verify_button_text") or "🟢 VERIFY NOW"
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(label, url=link, style="success")
+        ]])
+    else:
+        text += "\n\nVerification link is not available yet. Please contact the bot admin."
+
+    caption = bold_text(text)
+    photo = settings.get("verify_post_photo", "")
+    if photo:
+        try:
+            await message.reply_photo(photo=photo, caption=caption, reply_markup=markup)
+            return
+        except Exception:
+            logger.exception("Unable to send verification photo; falling back to text")
+    await message.reply_text(caption, reply_markup=markup, disable_web_page_preview=True)
+
+
+def ensure_private_access(update):
+    """Return True for groups, disabled verification, or active private access."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user or chat.type != "private":
+        return True
+    register_private_user(user)
+    return private_access_is_valid(user.id)
+
+
+def color_style(color):
+    return {"red": "danger", "blue": "primary", "green": "success"}.get(color, "success")
+
+
+def anime_button_color(item):
+    key = normalize(item.get("search_name", ""))
+    per_anime = settings.setdefault("anime_button_colors", {})
+    color = per_anime.get(key, settings.get("default_button_color", "green"))
+    return color if color in {"red", "blue", "green"} else "green"
+
+
+def add_search_count(item):
+    counts = settings.setdefault("search_counts", {})
+    key = normalize(item["search_name"])
+    try:
+        counts[key] = int(counts.get(key, 0)) + 1
+    except (TypeError, ValueError):
+        counts[key] = 1
+    save_settings()
+
+
+def render_template(template, **values):
+    result = str(template)
+    for key, value in values.items():
+        result = result.replace("{" + key + "}", str(value))
+    return result
+
+# =========================
+# SEARCH + SUGGESTIONS
+# =========================
+
+CHAT_PHRASES = {
+    "how are you", "how r u", "what are you doing", "what r u doing",
+    "good morning", "good night", "good evening", "good afternoon",
+    "thank you", "thanks", "welcome", "hello", "hi", "hey", "bro",
+    "guys", "when will the update come", "when is the next update",
+    "any updates", "what happened", "join now", "who are you",
+    "are you there", "ok", "okay", "yes", "no", "super", "nice",
+}
+QUESTION_STARTERS = {
+    "how", "when", "where", "why", "who", "what", "is", "are",
+    "can", "will", "did", "do", "does", "should", "any",
+}
+
+
+def looks_like_chat(message):
+    query = normalize(message)
+    if not query or query in CHAT_PHRASES:
+        return True
+    words = query.split()
+    if words[0] in {"hello", "hi", "hey", "thanks", "thank", "good", "bro", "guys", "dei", "machan"}:
+        return True
+    if words[0] in QUESTION_STARTERS:
+        return True
+    # Ignore common sentence openings to avoid turning group conversation into
+    # failed anime searches. Exact Search Name matches are checked before this.
+    if words[0] in {"we", "you", "please", "my", "your", "our"}:
+        return True
+    if words[0] in {"the", "no"} and len(words) >= 3:
+        return True
+    if words[0] in {"i", "im", "ive"} and len(words) > 1 and words[1] in {"want", "need", "am", "was", "have", "think", "like", "love", "mean", "guess", "just", "will"}:
+        return True
+    if words[0] == "it" and len(words) > 1 and words[1] in {"is", "was", "will", "has", "does", "looks"}:
+        return True
+    return False
+
+
+def find_exact_match(query):
+    """Exact, case-insensitive match against Search Name only (or its aliases)."""
+    normalized_query = normalize(query)
+    if not normalized_query:
+        return None
+    for item in load_anime():
+        if normalized_query in aliases_for(item["search_name"]):
+            return item
+    return None
+
+
+def similarity(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def find_suggestions(query, limit=5):
+    """Return likely saved title suggestions only; never send them as normal URLs."""
+    q = normalize(query)
+    if len(q) < 3:
+        return []
+
+    scored = []
+    for item in load_anime():
+        # Search Name is authoritative for both exact activation and suggestions.
+        # The visible button title is deliberately not searched as an alias.
+        candidates = aliases_for(item["search_name"])
+        # Do not turn a longer message containing a complete saved alias into
+        # an anime result/suggestion (for example, "naruto tamil").
+        padded_query = f" {q} "
+        if any(alias != q and f" {alias} " in padded_query for alias in candidates):
+            continue
+        best = 0.0
+        for candidate in candidates:
+            if len(candidate) < 3:
+                continue
+            score = similarity(q, candidate)
+            if candidate.startswith(q) and len(q) >= 3:
+                score = max(score, 0.74 + (len(q) / max(len(candidate), 1)) * 0.2)
+            for token in candidate.split():
+                if token.startswith(q) and len(q) >= 3:
+                    score = max(score, 0.76 + (len(q) / max(len(token), 1)) * 0.18)
+                if len(q) >= 4:
+                    score = max(score, similarity(q, token))
+            best = max(best, score)
+        threshold = 0.68 if len(q) >= 4 else 0.78
+        if best >= threshold:
+            scored.append((best, item))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    results = []
+    seen = set()
+    for _, item in scored:
+        key = normalize(item["search_name"])
+        if key not in seen:
+            results.append(item)
+            seen.add(key)
+        if len(results) >= limit:
+            break
+    return results
+
+
+async def send_anime_result(update, item, context):
+    add_search_count(item)
+    template = settings.get("post_text", DEFAULT_SETTINGS["post_text"])
+    text = render_template(
+        template,
+        anime=item["button_name"],
+        link=item["url"],
+        bot_title="ANIFLIX ANIME INDEX BOT TAMIL",
+        expiry=settings.get("expiry_minutes", 10),
+        genre=item.get("genre", "Not specified"),
+        rating=item.get("rating", "N/A"),
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📥 DOWNLOAD NOW",
+            url=item["url"],
+            style=color_style(anime_button_color(item)),
+        )
+    ]])
+
+    poster = settings.get("posters", {}).get(normalize(item["search_name"]), "")
+    random_posters = settings.get("random_posters", [])
+    if not poster and settings.get("poster_mode", "global") == "random" and random_posters:
+        poster = random.choice(random_posters)
+    if not poster:
+        poster = settings.get("global_poster", "")
+
+    message = update.effective_message
+    if poster:
+        try:
+            await message.reply_photo(photo=poster, caption=bold_text(text), reply_markup=keyboard)
+            return
+        except Exception:
+            logger.exception("Could not send anime poster; falling back to text")
+    await message.reply_text(
+        bold_text(text),
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+async def send_not_found(update, context, query_text):
+    template = settings.get("no_anime_text", DEFAULT_SETTINGS["no_anime_text"])
+    text = render_template(template, query=query_text)
+    token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:12]
+    context.application.bot_data.setdefault("request_actions", {})[token] = {
+        "title": query_text[:200],
+        "requester_id": update.effective_user.id,
+        "requester_name": update.effective_user.full_name or "Unknown",
+        "username": update.effective_user.username or "",
+        "chat_id": update.effective_chat.id,
+        "chat_type": update.effective_chat.type,
+        "chat_title": update.effective_chat.title or "" if update.effective_chat.type != "private" else "Private chat",
+        "created_at": time.time(),
+    }
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📩 REQUEST ANIME", callback_data=f"request:{token}", style="danger")
+    ]])
+    await update.effective_message.reply_text(bold_text(text), reply_markup=keyboard)
+
+
+async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not message.text or not user or not chat:
+        return
+    if message.text.startswith("/"):
+        return
+    if context.user_data.get("skip_search_message_id") == message.message_id:
+        context.user_data.pop("skip_search_message_id", None)
+        return
+    if context.user_data.get("admin_action") and is_admin(user.id):
+        return
+
+    if chat.type == "private":
+        register_private_user(user)
+        if not private_access_is_valid(user.id):
+            await send_verification_post(message, context)
+            return
+
+    query = message.text.strip()
+    exact = find_exact_match(query)
+    if exact:
+        await send_anime_result(update, exact, context)
+        return
+
+    # Only short, title-like queries enter the request/suggestion path.
+    if len(query) > 100 or len(query.split()) > 8:
+        return
+
+    suggestions = find_suggestions(query)
+    if suggestions:
+        action_store = context.application.bot_data.setdefault("suggestion_actions", {})
+        buttons = []
+        for item in suggestions:
+            token = secrets.token_urlsafe(5).replace("-", "").replace("_", "")[:10]
+            action_store[token] = normalize(item["search_name"])
+            buttons.append(InlineKeyboardButton(
+                item["button_name"], callback_data=f"suggest:{token}", style="primary"
+            ))
+        keyboard = InlineKeyboardMarkup([[button] for button in buttons])
+        await message.reply_text(
+            bold_text("🔍 NO EXACT MATCH\n\nDid you mean one of these saved anime?"),
+            reply_markup=keyboard,
+        )
+        return
+
+    if looks_like_chat(query):
+        return
+
+    await send_not_found(update, context, query)
+
+# =========================
+# USER ACCESS + REQUEST CALLBACKS
+# =========================
+
+
+def schedule_expiry_job(application, user_id, expiry):
+    job_queue = application.job_queue
+    if not job_queue:
+        logger.error("JobQueue is unavailable; install python-telegram-bot[job-queue].")
+        return
+    job_name = f"verify-expiry-{user_id}"
+    for job in job_queue.get_jobs_by_name(job_name):
+        job.schedule_removal()
+    delay = max(0, float(expiry) - time.time())
+    job_queue.run_once(
+        verification_expired_job,
+        when=delay,
+        data={"user_id": int(user_id), "expected_expiry": float(expiry)},
+        name=job_name,
+    )
+
+
+async def verification_expired_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data if context.job else {}
+    user_id = int(data.get("user_id", 0))
+    expected = float(data.get("expected_expiry", 0))
+    current = settings.get("user_access", {}).get(str(user_id))
+    try:
+        current = float(current)
+    except (TypeError, ValueError):
+        return
+    if abs(current - expected) > 1 or current > time.time():
+        return
+    if not settings.get("verification_enabled", False):
+        return
+    try:
+        await send_bold(
+            context.bot,
+            user_id,
+            "⏰ ACCESS EXPIRED\n\nYour 6-hour access to ANIFLIX Anime Index Bot has expired. Open the permanent verification link to activate another 6-hour session.",
+            disable_web_page_preview=True,
+        )
+        # Attach the current configured verification post/button when possible.
+        token = verification_keyboard()
+        if token:
+            me = await context.bot.get_me()
+            url = f"https://t.me/{me.username}?start=verify_{token}"
+            await send_bold(
+                context.bot,
+                user_id,
+                "Tap below to verify again:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(settings.get("verify_button_text", "🟢 VERIFY NOW"), url=url, style="success")
+                ]]),
+            )
+    except Exception:
+        logger.info("Could not send expiry notification to user %s", user_id, exc_info=True)
+
+
+async def activate_verification(update, context, token):
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not message:
+        return
+    register_private_user(user)
+    links = settings.get("verification_links", {})
+    if token not in links:
+        await send_verification_post(message, context)
+        return
+
+    current_expiry = settings.get("user_access", {}).get(str(user.id))
+    try:
+        current_expiry = float(current_expiry)
+    except (TypeError, ValueError):
+        current_expiry = 0
+
+    if current_expiry > time.time():
+        await reply_bold(
+            message,
+            "✅ YOU ARE ALREADY VERIFIED!\n\nYour existing 6-hour access is still active.\nAccess expires: " + format_ist(current_expiry),
+        )
+        return
+
+    expiry = time.time() + ACCESS_SECONDS
+    settings.setdefault("user_access", {})[str(user.id)] = expiry
+    save_settings()
+    schedule_expiry_job(context.application, user.id, expiry)
+    await reply_bold(
+        message,
+        "✅ YOU WERE VERIFIED!\n\nYou can use ANIFLIX Anime Index Bot for 6 hours.\nAccess expires: " + format_ist(expiry),
+    )
+
+
+async def generate_verification_link(bot):
+    token = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:18]
+    while token in settings.setdefault("verification_links", {}):
+        token = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:18]
+    settings["verification_links"][token] = {"created_at": time.time()}
+    settings["latest_verification_token"] = token
+    save_settings()
+    me = await bot.get_me()
+    return f"https://t.me/{me.username}?start=verify_{token}"
+
+
+async def bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+
+    if data.startswith("suggest:"):
+        token = data.split(":", 1)[1]
+        key = context.application.bot_data.get("suggestion_actions", {}).get(token)
+        if not key:
+            await query.message.reply_text(bold_text("This suggestion has expired. Please search again."))
+            return
+        if query.message.chat.type == "private" and not private_access_is_valid(query.from_user.id):
+            await send_verification_post(query.message, context)
+            return
+        item = next((x for x in load_anime() if normalize(x["search_name"]) == key), None)
+        if not item:
+            await query.message.reply_text(bold_text("That anime is no longer in the saved list."))
+            return
+        await send_anime_result(update, item, context)
+        return
+
+    if data.startswith("request:"):
+        token = data.split(":", 1)[1]
+        action = context.application.bot_data.get("request_actions", {}).get(token)
+        if not action:
+            await query.message.reply_text(bold_text("This request button has expired. Please search again."))
+            return
+        if int(query.from_user.id) != int(action["requester_id"]):
+            await query.answer("Only the person who searched can send this request.", show_alert=True)
+            return
+
+        dedupe_key = normalize(action["title"])
+        # Limit repeated requests from one member for the same title to one per 10 minutes.
+        key = f"{action['requester_id']}:{dedupe_key}"
+        last = float(settings.setdefault("request_dedupe", {}).get(key, 0) or 0)
+        if time.time() - last < 600:
+            await query.message.reply_text(bold_text("✅ Your request was already sent recently. Please wait before requesting it again."))
+            return
+        settings["request_dedupe"][key] = time.time()
+        save_settings()
+        source = action.get("chat_title") or action.get("chat_type", "unknown")
+        admin_text = (
+            "📩 NEW ANIME REQUEST\n\n"
+            f"📌 Requested Anime: {action['title']}\n"
+            f"👤 Member: {action['requester_name']}\n"
+            f"🆔 User ID: {action['requester_id']}\n"
+        )
+        if action.get("username"):
+            admin_text += f"🔗 Username: @{action['username']}\n"
+        admin_text += f"📍 Source: {source}\n⏰ Requested At: {format_ist(time.time())}"
+        pending_record = {
+            "id": token,
+            "text": admin_text,
+            "created_at": time.time(),
+            "sent_to": [],
+        }
+        settings.setdefault("pending_requests", []).append(pending_record)
+        save_settings()
+        delivered = 0
+        for admin_id in ADMIN_IDS:
+            before_sent = set(pending_record.get("sent_to", []))
+            await deliver_pending_requests_to_admin(context.bot, admin_id)
+            if int(admin_id) in set(pending_record.get("sent_to", [])) or int(admin_id) in before_sent:
+                delivered += 1
+        await query.message.reply_text(
+            bold_text("✅ Your anime request has been sent to the admin. Thank you!" if delivered else "✅ Your request has been saved. The admin will receive it when they open the bot in private chat."),
+        )
+
+# =========================
+# COMMANDS
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        return
+    if chat.type == "private":
+        register_private_user(user)
+        if is_admin(user.id):
+            await deliver_pending_requests_to_admin(context.bot, user.id)
+
+    if chat.type == "private" and context.args:
+        payload = context.args[0]
+        if payload.startswith("verify_"):
+            await activate_verification(update, context, payload[len("verify_"):])
+            return
+
+    if chat.type == "private" and settings.get("verification_enabled", False) and not private_access_is_valid(user.id):
+        await send_verification_post(message, context)
+        return
+
+    await message.reply_text(
+        bold_text(settings.get("welcome_text", DEFAULT_SETTINGS["welcome_text"])),
+        reply_markup=welcome_keyboard(),
+    )
+
+
+async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message:
+        return
+    if message.chat.type == "private":
+        register_private_user(update.effective_user)
+        if not private_access_is_valid(update.effective_user.id):
+            await send_verification_post(message, context)
+            return
+
+    anime = load_anime()
+    if not anime:
+        await reply_bold(message, "The anime list is currently empty.")
+        return
+
+    lines = ["🍥 ANIFLIX ANIME INDEX TAMIL 🍥", ""]
+    lines.extend(f"{index}. {item['button_name']}" for index, item in enumerate(anime, start=1))
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 3800:
+            chunks.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    sent_ids = []
+    for chunk in chunks:
+        sent = await message.reply_text(
+            bold_text(chunk + "\n\n⏳ This list will be deleted automatically in 10 minutes.")
+        )
+        sent_ids.append(sent.message_id)
+    record = {
+        "id": secrets.token_hex(8),
+        "chat_id": int(message.chat_id),
+        "message_ids": sent_ids,
+        "created_at": time.time(),
+    }
+    settings.setdefault("pending_list_deletions", []).append(record)
+    save_settings()
+    schedule_list_deletion(context.application, record)
+
+
+def schedule_list_deletion(application, record):
+    if not application.job_queue:
+        logger.error("JobQueue unavailable; /list auto-delete cannot be scheduled.")
+        return
+    try:
+        created = float(record.get("created_at", time.time()))
+    except (TypeError, ValueError):
+        created = time.time()
+    delay = max(0, created + LIST_DELETE_SECONDS - time.time())
+    application.job_queue.run_once(
+        delete_list_job,
+        when=delay,
+        data=dict(record),
+        name=f"list-delete-{record.get('id', record.get('chat_id'))}",
+    )
+
+
+async def delete_list_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data if context.job else {}
+    chat_id = data.get("chat_id")
+    message_ids = data.get("message_ids", [])
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            logger.info("Could not delete /list message %s in chat %s", message_id, chat_id)
+
+    record_id = data.get("id")
+    pending = settings.setdefault("pending_list_deletions", [])
+    settings["pending_list_deletions"] = [record for record in pending if record.get("id") != record_id]
+    save_settings()
+    try:
+        await send_bold(
+            context.bot,
+            chat_id,
+            "/list has been deleted. Send /list to view the available anime.",
+        )
+    except Exception:
+        logger.info("Could not send /list expiry notice to chat %s", chat_id, exc_info=True)
+
+
+async def trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message.chat.type == "private":
+        register_private_user(update.effective_user)
+        if not private_access_is_valid(update.effective_user.id):
+            await send_verification_post(message, context)
+            return
+    counts = settings.get("search_counts", {})
+    anime = load_anime()
+    by_name = {normalize(item["search_name"]): item for item in anime}
+    ranked = []
+    for key, count in counts.items():
+        try:
+            number = int(count)
+        except (TypeError, ValueError):
+            continue
+        item = by_name.get(normalize(key))
+        if item and number > 0:
+            ranked.append((number, item))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    if not ranked:
+        await reply_bold(message, "📈 TRENDING ANIME SEARCHES\n\nNo searches have been recorded yet.")
+        return
+    lines = ["📈 TRENDING ANIME SEARCHES", "", "Most searched anime on ANIFLIX:", ""]
+    lines.extend(f"{rank}. {item['button_name']} — {count} searches" for rank, (count, item) in enumerate(ranked[:10], start=1))
+    await reply_bold(message, "\n".join(lines))
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await reply_bold(message, "You are not authorized to use this command.")
+        return
+    users = {int(uid) for uid in settings.get("registered_users", []) if str(uid).isdigit()}
+    await reply_bold(message, f"👥 ANIFLIX BOT USERS\n\nTotal registered PM users: {len(users)}")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await reply_bold(message, "You are not authorized to use this command.")
+        return
+    source = message.reply_to_message if message else None
+    if not source:
+        await reply_bold(message, "Reply to the text/photo/video/document/sticker you want to broadcast, then send /broadcast.")
+        return
+
+    targets = sorted({int(uid) for uid in settings.get("registered_users", []) if str(uid).isdigit()})
+    delivered = failed = 0
+    for uid in targets:
+        try:
+            await context.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=source.chat_id,
+                message_id=source.message_id,
+            )
+            delivered += 1
+        except Exception:
+            failed += 1
+            logger.info("Broadcast delivery failed for user %s", uid, exc_info=True)
+        await asyncio.sleep(0.04)
+
+    await reply_bold(
+        message,
+        f"📢 BROADCAST COMPLETED\n\nTotal users: {len(targets)}\n✅ Delivered: {delivered}\n❌ Failed: {failed}",
+    )
+
+
+async def verifylinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await reply_bold(message, "You are not authorized to generate verification links.")
+        return
+    link = await generate_verification_link(context.bot)
+    try:
+        await send_bold(
+            context.bot,
+            user.id,
+            "🔗 PERMANENT VERIFICATION LINK GENERATED\n\nThis link itself does not expire. Each person who opens it receives their own 6-hour access period:\n\n" + link,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("OPEN VERIFICATION LINK", url=link, style="success")
+            ]]),
+            disable_web_page_preview=True,
+        )
+        await reply_bold(message, "✅ Your new permanent verification link was sent to your private chat.")
+    except Exception:
+        logger.exception("Could not send verification link to admin PM")
+        await reply_bold(message, "❌ I could not PM you. Open the bot privately with /start, then run /verifylinks again.")
+
+
+async def addposters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await reply_bold(update.effective_message, "You are not authorized to add posters.")
+        return
+    context.user_data.pop("admin_action", None)
+    context.user_data["poster_caption_mode"] = True
+    await reply_bold(
+        update.effective_message,
+        "🖼 POSTER UPLOAD MODE ENABLED\n\nSend each poster photo separately with its exact saved anime title in the photo caption.\nExample caption: Naruto\n\nThe poster is matched to the existing anime entry. Existing posters are not overwritten. Use /cancelposters when finished.",
+    )
+
+
+async def cancelposters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await reply_bold(update.effective_message, "You are not authorized.")
+        return
+    context.user_data.pop("poster_caption_mode", None)
+    context.user_data.pop("admin_action", None)
+    await reply_bold(update.effective_message, "✅ Poster upload mode cancelled.")
+
+# =========================
+# ADMIN PANEL KEYBOARDS
 # =========================
 
 
 def main_admin_keyboard():
+    verification_label = "🔐 Verification: ON" if settings.get("verification_enabled") else "🔐 Verification: OFF"
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➕ Add Anime", callback_data="admin_add"),
-            InlineKeyboardButton("➖ Remove Anime", callback_data="admin_remove"),
-        ],
-        [
-            InlineKeyboardButton("📄 Import TXT", callback_data="admin_import"),
-            InlineKeyboardButton("📚 View List", callback_data="admin_list"),
-        ],
-        [
-            InlineKeyboardButton("🖼 Poster Settings", callback_data="admin_poster_settings"),
-            InlineKeyboardButton("📝 Post Text", callback_data="admin_post_text"),
-        ],
-        [
-            InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome_text"),
-            InlineKeyboardButton("❌ No Anime Message", callback_data="admin_no_anime_text"),
-        ],
+        [InlineKeyboardButton("➕ Add Anime", callback_data="admin_add", style="success"), InlineKeyboardButton("➖ Remove Anime", callback_data="admin_remove", style="danger")],
+        [InlineKeyboardButton("📄 Import TXT", callback_data="admin_import"), InlineKeyboardButton("📚 View List", callback_data="admin_list")],
+        [InlineKeyboardButton("🖼 Poster Settings", callback_data="admin_poster_settings"), InlineKeyboardButton("📝 Post Text", callback_data="admin_post_text")],
+        [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome_text"), InlineKeyboardButton("❌ No Anime Message", callback_data="admin_no_anime_text")],
+        [InlineKeyboardButton("🎨 Button Colour", callback_data="admin_button_colors")],
+        [InlineKeyboardButton("🔗 Verify Link", callback_data="admin_verify_link"), InlineKeyboardButton("📝 Verify Post", callback_data="admin_verify_post")],
+        [InlineKeyboardButton(verification_label, callback_data="admin_verify_toggle", style="success" if settings.get("verification_enabled") else "danger")],
         [InlineKeyboardButton("⏱ Set Expiry", callback_data="admin_expiry")],
-        [InlineKeyboardButton("➕ Add Groups", callback_data="admin_add_groups")],
     ])
 
 
-async def add_posters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start a title-by-title poster collection in the current group."""
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user:
-        return
-
-    if message.chat.type not in ("group", "supergroup"):
-        await message.reply_text("Use /addposters inside the group where you want to collect posters.")
-        return
-
-    if not await is_group_admin(context.bot, message.chat_id, user.id):
-        await message.reply_text("Only a group administrator can start poster collection.")
-        return
-
-    existing = context.chat_data.get("poster_collection")
-    if existing:
-        # Keep the active session intact; show only its current title.
-        items = existing.get("items", [])
-        index = int(existing.get("index", 0))
-        if index < len(items):
-            await message.reply_text(items[index]["button_name"])
-        return
-
-    anime = load_anime()
-    posters = settings.setdefault("posters", {})
-    items = []
-    seen = set()
-
-    for item in anime:
-        poster_key = normalize(item["search_name"])
-        if not poster_key or poster_key in seen:
-            continue
-        seen.add(poster_key)
-        if posters.get(poster_key):
-            continue
-        items.append({
-            "button_name": item["button_name"],
-            "poster_key": poster_key,
-        })
-
-    if not items:
-        await message.reply_text("All anime entries already have individual posters.")
-        return
-
-    context.chat_data["poster_collection"] = {
-        "user_id": user.id,
-        "items": items,
-        "index": 0,
-    }
-    await send_next_poster_title(message, context)
+def color_keyboard(prefix):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔴 RED", callback_data=f"{prefix}:red", style="danger"),
+        InlineKeyboardButton("🔵 BLUE", callback_data=f"{prefix}:blue", style="primary"),
+        InlineKeyboardButton("🟢 GREEN", callback_data=f"{prefix}:green", style="success"),
+    ], [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]])
 
 
-async def skip_poster(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Skip the current title and send the next title, without extra text."""
-    message = update.effective_message
-    if not message or message.chat.type not in ("group", "supergroup"):
-        return
-    if not await poster_session_admin(update, context):
-        return
-
-    session = context.chat_data.get("poster_collection")
-    session["index"] = int(session.get("index", 0)) + 1
-    await send_next_poster_title(message, context)
-
-
-async def cancel_posters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the current poster collection silently."""
-    message = update.effective_message
-    if not message or message.chat.type not in ("group", "supergroup"):
-        return
-    if not await poster_session_admin(update, context):
-        return
-    context.chat_data.pop("poster_collection", None)
+def verify_post_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Edit Message", callback_data="admin_verify_text")],
+        [InlineKeyboardButton("🖼 Set Photo", callback_data="admin_verify_photo"), InlineKeyboardButton("🗑 Remove Photo", callback_data="admin_verify_remove_photo")],
+        [InlineKeyboardButton("🔘 Change Button Text", callback_data="admin_verify_button_text")],
+        [InlineKeyboardButton("👁 Preview", callback_data="admin_verify_preview")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
+    ])
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.effective_message
-
     if not user or not message:
         return
-
     if not is_admin(user.id):
-        await message.reply_text("You are not authorized to use this panel.")
+        await reply_bold(message, "You are not authorized to use this panel.")
         return
-
     context.user_data.pop("admin_action", None)
-    await message.reply_text(
-        "⚙️ ANIFLIX ADMIN PANEL\n\nChoose an action:",
-        reply_markup=main_admin_keyboard(),
-    )
+    context.user_data.pop("poster_caption_mode", None)
+    await message.reply_text(bold_text("⚙️ ANIFLIX ADMIN PANEL\n\nChoose an action:"), reply_markup=main_admin_keyboard())
 
+# =========================
+# ADMIN CALLBACKS
+# =========================
 
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query:
+        return
     await query.answer()
     user = query.from_user
-
     if not is_admin(user.id):
-        await query.message.reply_text("You are not authorized.")
+        await query.message.reply_text(bold_text("You are not authorized."))
         return
+    action = query.data or ""
 
-    action = query.data
+    # Avoid leaving caption-based poster mode active while editing unrelated
+    # admin settings (for example, the verification photo).
+    poster_actions = {
+        "admin_poster_settings", "admin_addposters", "admin_poster_global_menu",
+        "admin_global_poster", "admin_random_poster_menu", "admin_random_add_more",
+        "admin_random_clear_first", "random_poster_done", "random_poster_cancel",
+    }
+    if action not in poster_actions and not action.startswith("admin_poster_"):
+        context.user_data.pop("poster_caption_mode", None)
 
     if action == "admin_back":
         context.user_data.pop("admin_action", None)
+        context.user_data.pop("pending_anime_color_key", None)
+        context.user_data.pop("pending_anime_color_title", None)
+        await query.message.reply_text(bold_text("⚙️ ANIFLIX ADMIN PANEL\n\nChoose an action:"), reply_markup=main_admin_keyboard())
+        return
+
+    if action == "admin_verify_toggle":
+        settings["verification_enabled"] = not settings.get("verification_enabled", False)
+        save_settings()
+        if settings["verification_enabled"]:
+            # Re-arm expiry notifications that may have elapsed while the
+            # verification feature was switched OFF.
+            for user_id, raw_expiry in settings.get("user_access", {}).items():
+                try:
+                    schedule_expiry_job(context.application, int(user_id), float(raw_expiry))
+                except (TypeError, ValueError):
+                    continue
+        state = "ON" if settings["verification_enabled"] else "OFF"
+        await query.message.reply_text(bold_text(f"✅ PM verification is now {state}. Group search remains free."), reply_markup=main_admin_keyboard())
+        return
+
+    if action == "admin_verify_link":
         await query.message.reply_text(
-            "⚙️ ANIFLIX ADMIN PANEL\n\nChoose an action:",
-            reply_markup=main_admin_keyboard(),
+            bold_text("🔗 GENERATE A PERMANENT VERIFICATION LINK?\n\nThe link itself will not expire. Every user gets a separate 6-hour timer when they open it."),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ YES, GENERATE", callback_data="verify_link_yes", style="success"),
+                InlineKeyboardButton("❌ NO", callback_data="verify_link_no", style="danger"),
+            ]]),
         )
         return
 
-    if action == "admin_add_groups":
-        bot = await context.bot.get_me()
-        if not bot.username:
-            await query.message.reply_text("Could not get the bot username. Please try again later.")
-            return
-        add_group_url = f"https://t.me/{bot.username}?startgroup=true"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Add ANIFLIX to a Group", url=add_group_url)
-        ]])
+    if action == "verify_link_no":
+        await query.message.reply_text(bold_text("❎ Verification link generation cancelled."))
+        return
+
+    if action == "verify_link_yes":
+        link = await generate_verification_link(context.bot)
+        try:
+            await send_bold(
+                context.bot,
+                user.id,
+                "🔗 PERMANENT VERIFICATION LINK GENERATED\n\nThis link does not expire. Each user receives their own 6-hour access period:\n\n" + link,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("OPEN VERIFICATION LINK", url=link, style="success")
+                ]]),
+                disable_web_page_preview=True,
+            )
+            await query.message.reply_text(bold_text("✅ Your new permanent verification link was sent to your private chat."))
+        except Exception:
+            logger.exception("Could not PM generated verification link to admin")
+            await query.message.reply_text(bold_text("❌ I could not PM you. Start the bot privately first, then generate the link again."))
+        return
+
+    if action == "admin_verify_post":
         await query.message.reply_text(
-            "➕ ADD ANIFLIX TO GROUPS\n\n"
-            "Use the button below and choose a group. A group administrator must confirm adding the bot.\n\n"
-            "After adding it, promote the bot to administrator so it can receive group messages and poster photos.\n\n"
-            "Note: Telegram does not allow bots to join a group automatically from an invite link.",
-            reply_markup=keyboard,
+            bold_text("📝 VERIFY POST SETTINGS\n\nCustomize the message, optional photo, and green verification button."),
+            reply_markup=verify_post_keyboard(),
         )
+        return
+
+    if action == "admin_verify_text":
+        context.user_data["admin_action"] = "admin_verify_text"
+        await query.message.reply_text(bold_text("Send the new verification message text."))
+        return
+
+    if action == "admin_verify_photo":
+        context.user_data["admin_action"] = "admin_verify_photo"
+        await query.message.reply_text(bold_text("Now send the photo to attach to the verification post."))
+        return
+
+    if action == "admin_verify_remove_photo":
+        settings["verify_post_photo"] = ""
+        save_settings()
+        await query.message.reply_text(bold_text("✅ Verification photo removed."), reply_markup=verify_post_keyboard())
+        return
+
+    if action == "admin_verify_button_text":
+        context.user_data["admin_action"] = "admin_verify_button_text"
+        await query.message.reply_text(bold_text("Send the new Verify Now button label. The button will remain green."))
+        return
+
+    if action == "admin_verify_preview":
+        text = settings.get("verify_post_text", DEFAULT_SETTINGS["verify_post_text"])
+        token = verification_keyboard()
+        markup = None
+        if token:
+            me = await context.bot.get_me()
+            link = f"https://t.me/{me.username}?start=verify_{token}"
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton(settings.get("verify_button_text", "🟢 VERIFY NOW"), url=link, style="success")
+            ]])
+        photo = settings.get("verify_post_photo", "")
+        if photo:
+            await query.message.reply_photo(photo=photo, caption=bold_text(text), reply_markup=markup)
+        else:
+            await query.message.reply_text(bold_text(text), reply_markup=markup)
+        return
+
+    if action == "admin_button_colors":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 Set Default Colour", callback_data="admin_default_color")],
+            [InlineKeyboardButton("🎯 Set Individual Anime Colour", callback_data="admin_individual_color")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
+        ])
+        await query.message.reply_text(bold_text(f"🎨 BUTTON COLOUR SETTINGS\n\nCurrent default: {settings.get('default_button_color', 'green').upper()}\nIndividual anime settings override the default."), reply_markup=keyboard)
+        return
+
+    if action == "admin_default_color":
+        await query.message.reply_text(bold_text("Choose the default colour for anime download buttons:"), reply_markup=color_keyboard("default_color"))
+        return
+
+    if action.startswith("default_color:"):
+        color = action.split(":", 1)[1]
+        if color not in {"red", "blue", "green"}:
+            return
+        settings["default_button_color"] = color
+        save_settings()
+        await query.message.reply_text(bold_text(f"✅ Default anime button colour set to {color.upper()}. Individual overrides are unchanged."))
+        return
+
+    if action == "admin_individual_color":
+        context.user_data["admin_action"] = "admin_individual_color"
+        await query.message.reply_text(bold_text("Send the exact saved anime title or Search Name whose button colour you want to change."))
+        return
+
+    if action.startswith("anime_color:"):
+        color = action.split(":", 1)[1]
+        key = context.user_data.get("pending_anime_color_key")
+        if color not in {"red", "blue", "green"} or not key:
+            await query.message.reply_text(bold_text("Please select an anime first."))
+            return
+        settings.setdefault("anime_button_colors", {})[key] = color
+        save_settings()
+        title = context.user_data.pop("pending_anime_color_title", "Anime")
+        context.user_data.pop("pending_anime_color_key", None)
+        await query.message.reply_text(bold_text(f"✅ {title} button colour set to {color.upper()}."))
         return
 
     if action == "admin_poster_settings":
-        context.user_data.pop("admin_action", None)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 Global Poster", callback_data="admin_poster_global_menu")],
             [InlineKeyboardButton("🖼 Separate Poster", callback_data="admin_separate_poster")],
+            [InlineKeyboardButton("🧾 Add Posters by Caption", callback_data="admin_addposters")],
             [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
         ])
-        await query.message.reply_text("🖼 POSTER SETTINGS\n\nChoose poster mode:", reply_markup=keyboard)
+        await query.message.reply_text(bold_text("🖼 POSTER SETTINGS\n\nChoose poster mode:"), reply_markup=keyboard)
+        return
+
+    if action == "admin_addposters":
+        context.user_data.pop("admin_action", None)
+        context.user_data["poster_caption_mode"] = True
+        await query.message.reply_text(bold_text("🖼 POSTER UPLOAD MODE ENABLED\n\nSend each photo with the exact saved anime title in its caption. Use /cancelposters when finished."))
         return
 
     if action == "admin_poster_global_menu":
@@ -794,12 +1357,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🎲 Random Poster", callback_data="admin_random_poster_menu")],
             [InlineKeyboardButton("⬅️ Back", callback_data="admin_poster_settings")],
         ])
-        await query.message.reply_text(
-            "🌐 GLOBAL POSTER OPTIONS\n\n"
-            "Global Poster: one image for every anime unless a separate poster is set.\n"
-            "Random Poster: collect up to 20 images and randomly use one for each post.",
-            reply_markup=keyboard,
-        )
+        await query.message.reply_text(bold_text("🌐 GLOBAL POSTER OPTIONS\n\nGlobal Poster: one image for every anime unless a separate poster is set.\nRandom Poster: collect up to 20 images and randomly use one for each post."), reply_markup=keyboard)
         return
 
     if action == "admin_random_poster_menu":
@@ -810,27 +1368,21 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Back", callback_data="admin_poster_global_menu")],
         ])
         current_count = len(settings.get("random_posters", []))
-        await query.message.reply_text(
-            f"🎲 RANDOM POSTER SETTINGS\n\nSaved posters: {current_count}/20\n\n"
-            "Add More keeps your saved posters. Clear From First starts a fresh collection.",
-            reply_markup=keyboard,
-        )
+        await query.message.reply_text(bold_text(f"🎲 RANDOM POSTER SETTINGS\n\nSaved posters: {current_count}/20\n\nAdd More keeps your saved posters. Clear From First starts a fresh collection."), reply_markup=keyboard)
         return
 
     if action == "admin_random_add_more":
         existing = list(settings.get("random_posters", []))[:20]
         if len(existing) >= 20:
-            await query.message.reply_text("⚠️ You already have 20 posters. Clear the collection before adding more.")
+            await query.message.reply_text(bold_text("⚠️ You already have 20 posters. Clear the collection before adding more."))
             return
         context.user_data["random_poster_collection"] = existing
-        context.user_data["random_poster_start_count"] = len(existing)
         context.user_data["admin_action"] = "admin_random_poster"
         await query.message.reply_text(
-            f"➕ Send additional poster photos. You have {len(existing)}/20 saved; you can add {20-len(existing)} more.\n"
-            "Tap Done when finished.",
+            bold_text(f"➕ Send additional poster photos. Saved: {len(existing)}/20. Tap Done when finished."),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done")],
-                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel")],
+                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done", style="success")],
+                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel", style="danger")],
             ]),
         )
         return
@@ -838,13 +1390,11 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "admin_random_clear_first":
         context.user_data["admin_action"] = "admin_random_poster"
         context.user_data["random_poster_collection"] = []
-        context.user_data["random_poster_start_count"] = 0
         await query.message.reply_text(
-            "🗑️ Old random poster collection cleared from the new setup. Send up to 20 new poster photos, then tap Done.\n"
-            "The previously saved collection will only be replaced when you tap Done.",
+            bold_text("🗑️ Send up to 20 new random poster photos, then tap Done. The old collection is replaced only when you tap Done."),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done")],
-                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel")],
+                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done", style="success")],
+                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel", style="danger")],
             ]),
         )
         return
@@ -852,130 +1402,139 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "random_poster_done":
         collected = context.user_data.get("random_poster_collection", [])
         if not collected:
-            await query.message.reply_text("Please send at least one poster photo first.")
+            await query.message.reply_text(bold_text("Please send at least one poster photo first."))
             return
         settings["random_posters"] = collected[:20]
         settings["poster_mode"] = "random"
         save_settings()
         context.user_data.pop("random_poster_collection", None)
         context.user_data.pop("admin_action", None)
-        await query.message.reply_text(
-            f"✅ Random poster collection saved: {len(settings['random_posters'])} poster(s)."
-        )
+        await query.message.reply_text(bold_text(f"✅ Random poster collection saved: {len(settings['random_posters'])} poster(s)."))
         return
 
     if action == "random_poster_cancel":
         context.user_data.pop("random_poster_collection", None)
         context.user_data.pop("admin_action", None)
-        await query.message.reply_text("❎ Random poster setup cancelled. Your saved poster collection was not changed.")
+        await query.message.reply_text(bold_text("❎ Random poster setup cancelled. Your saved poster collection was not changed."))
         return
 
     if action == "admin_list":
         anime = load_anime()
         if not anime:
-            await query.message.reply_text("The anime list is empty.")
+            await query.message.reply_text(bold_text("The anime list is empty."))
         else:
             lines = [
                 f"{i}. {item['button_name']} | {item.get('genre', 'Not specified')} | {item.get('rating', 'N/A')} | {item['url']}"
                 for i, item in enumerate(anime, start=1)
             ]
-            for start_index in range(0, len(lines), 40):
-                await query.message.reply_text("\n".join(lines[start_index:start_index + 40]))
+            for start_index in range(0, len(lines), 35):
+                await query.message.reply_text(bold_text("\n".join(lines[start_index:start_index + 35])))
         return
 
     instructions = {
-        "admin_add": (
-            "Send anime entries in this format:\n"
-            "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n\n"
-            "Example:\nNaruto - https://example.com/naruto - Action, Adventure - 8.4 - naruto\n\n"
-            "You can send multiple lines."
-        ),
-        "admin_remove": "Send the anime title or URL you want to remove.",
-        "admin_import": (
-            "Upload a .txt file with one entry per line:\n"
-            "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n"
-            "Example:\nNaruto - https://example.com/naruto - Action, Adventure - 8.4 - naruto"
-        ),
+        "admin_add": "Send anime entries in this format:\nBUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n\nExample:\nNaruto - https://example.com/naruto - Action, Adventure - 8.4 - naruto\n\nYou can send multiple lines.",
+        "admin_remove": "Send the exact anime title, Search Name, or URL you want to remove.",
+        "admin_import": "Upload a .txt file with one entry per line:\nBUTTON NAME - URL - GENRE - RATING - SEARCH NAME",
         "admin_global_poster": "Send one photo to use as the global poster.",
-        "admin_random_poster": (
-            "Send up to 20 poster photos, one photo per message.\n"
-            "When finished, tap ✅ Done. The saved collection will be randomized across anime posts."
-        ),
-        "admin_post_text": (
-            "Send your post template.\n"
-            "Available placeholders: {anime}, {link}, {bot_title}, {expiry}, {genre}, {rating}"
-        ),
-        "admin_welcome_text": (
-            "Send the new /start welcome message.\n"
-            "The ONGOING ANIME and SUPPORT GROUP buttons will remain underneath it."
-        ),
-        "admin_no_anime_text": (
-            "Send the new no-anime-found message.\n"
-            "Optional placeholder: {query}\n"
-            "Random anime suggestions will still appear underneath when anime are available."
-        ),
+        "admin_random_poster": "Send up to 20 poster photos, one photo per message. Tap Done when finished.",
+        "admin_post_text": "Send your anime result template. Placeholders: {anime}, {link}, {bot_title}, {expiry}, {genre}, {rating}",
+        "admin_welcome_text": "Send the new /start welcome message.",
+        "admin_no_anime_text": "Send the new no-anime-found message. Optional placeholder: {query}",
         "admin_expiry": "Send the expiry value in minutes.",
-        "admin_separate_poster": "Send the anime title first. Then send the photo for that anime.",
+        "admin_separate_poster": "Send the exact anime title first. Then send the photo for that anime.",
     }
-
     if action not in instructions:
-        await query.message.reply_text("Unknown action.")
+        await query.message.reply_text(bold_text("Unknown admin action."))
         return
-
     context.user_data["admin_action"] = action
     if action == "admin_random_poster":
         context.user_data["random_poster_collection"] = list(settings.get("random_posters", []))[:20]
-    await query.message.reply_text(instructions[action])
+    await query.message.reply_text(bold_text(instructions[action]))
+
+# =========================
+# ADMIN MESSAGE / MEDIA PROCESSORS
+# =========================
+
+async def notify_new_anime(context, titles):
+    if not titles:
+        return
+    users = sorted({int(uid) for uid in settings.get("registered_users", []) if str(uid).isdigit()})
+    if not users:
+        return
+    lines = ["🆕 NEW ANIME ADDED 👇", ""]
+    lines.extend(f"• {title}" for title in titles)
+    lines.extend(["", "📋 Copy the anime title and paste it here to get the anime.", "", "Powered By: @ANIFLIXANIMETAMIL"])
+    # Keep each Telegram message below the 4096-character message limit.
+    chunks = []
+    current = "🆕 NEW ANIME ADDED 👇\n\n"
+    for title in titles:
+        line = f"• {title}\n"
+        if len(current) + len(line) > 3300:
+            chunks.append(current.rstrip())
+            current = "🆕 NEW ANIME ADDED 👇\n\n"
+        current += line
+    current += "\n📋 Copy the anime title and paste it here to get the anime.\n\nPowered By: @ANIFLIXANIMETAMIL"
+    chunks.append(current)
+    for uid in users:
+        for chunk in chunks:
+            try:
+                await send_bold(context.bot, uid, chunk)
+            except Exception:
+                logger.info("Could not send new-anime notification to user %s", uid, exc_info=True)
+                break
+        await asyncio.sleep(0.03)
 
 
 async def process_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
-
     if not message or not message.text or not user:
         return
-
     action = context.user_data.get("admin_action")
     if not action or not is_admin(user.id):
         return
-
     text = message.text.strip()
     anime = load_anime()
 
     if action == "admin_add":
-        added = 0
+        added_titles = []
         for line in text.splitlines():
             entry = parse_anime_entry(line)
             if not entry:
                 continue
-            if any(normalize(item["search_name"]) == normalize(entry["search_name"]) for item in anime):
+            existing_aliases = {alias for item in anime for alias in aliases_for(item["search_name"])}
+            if any(alias in existing_aliases for alias in aliases_for(entry["search_name"])):
                 continue
             anime.append(entry)
-            added += 1
-
+            added_titles.append(entry["button_name"])
         save_anime(anime)
         context.user_data.pop("admin_action", None)
         mark_as_admin_input(context, message)
-        await message.reply_text(f"✅ Added {added} anime entry/entries.")
+        await reply_bold(message, f"✅ Added {len(added_titles)} new anime entr(y/ies).")
+        if added_titles:
+            await notify_new_anime(context, added_titles)
         return
 
     if action == "admin_remove":
-        updated = [
-            item for item in anime
-            if normalize(text) not in {
-                normalize(item["button_name"]),
-                normalize(item["search_name"]),
-            }
-            and text != item["url"]
-        ]
+        updated = [item for item in anime if normalize(text) not in {normalize(item["button_name"]), *aliases_for(item["search_name"])} and text != item["url"]]
         removed = len(anime) - len(updated)
         save_anime(updated)
         context.user_data.pop("admin_action", None)
         mark_as_admin_input(context, message)
-        await message.reply_text(
-            f"✅ Removed {removed} entry/entries." if removed
-            else "❌ No matching anime was found."
-        )
+        await reply_bold(message, f"✅ Removed {removed} entry/entries." if removed else "❌ No matching anime was found.")
+        return
+
+    if action == "admin_individual_color":
+        target = normalize(text)
+        matched = next((item for item in anime if target == normalize(item["button_name"]) or target in aliases_for(item["search_name"])), None)
+        if not matched:
+            await reply_bold(message, "❌ Anime not found. Send the exact saved title or Search Name.")
+            return
+        context.user_data["pending_anime_color_key"] = normalize(matched["search_name"])
+        context.user_data["pending_anime_color_title"] = matched["button_name"]
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        await message.reply_text(bold_text(f"Choose the button colour for {matched['button_name']}:") , reply_markup=color_keyboard("anime_color"))
         return
 
     if action == "admin_post_text":
@@ -983,103 +1542,112 @@ async def process_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         save_settings()
         context.user_data.pop("admin_action", None)
         mark_as_admin_input(context, message)
-        await message.reply_text("✅ Post text updated.")
+        await reply_bold(message, "✅ Anime post text updated.")
         return
 
     if action == "admin_welcome_text":
         if not text:
-            await message.reply_text("Please send a welcome message that isn't empty.")
+            await reply_bold(message, "Please send a welcome message that isn't empty.")
             return
         settings["welcome_text"] = text
         save_settings()
         context.user_data.pop("admin_action", None)
         mark_as_admin_input(context, message)
-        await message.reply_text("✅ Welcome message updated. It will be used by /start.")
+        await reply_bold(message, "✅ Welcome message updated.")
         return
 
     if action == "admin_no_anime_text":
         if not text:
-            await message.reply_text("Please send a message that isn't empty.")
+            await reply_bold(message, "Please send a message that isn't empty.")
             return
         settings["no_anime_text"] = text
         save_settings()
         context.user_data.pop("admin_action", None)
         mark_as_admin_input(context, message)
-        await message.reply_text("✅ No Anime Found message updated.")
+        await reply_bold(message, "✅ No Anime Found message updated.")
         return
 
     if action == "admin_expiry":
-        if not text.isdigit() or int(text) < 1:
-            await message.reply_text("Please send a positive number of minutes.")
+        if not text.isdigit() or int(text) < 1 or int(text) > 1440:
+            await reply_bold(message, "Send a positive number of minutes, up to 1440.")
             return
         settings["expiry_minutes"] = int(text)
         save_settings()
         context.user_data.pop("admin_action", None)
         mark_as_admin_input(context, message)
-        await message.reply_text(f"✅ Expiry setting saved: {text} minutes.")
+        await reply_bold(message, f"✅ Expiry setting saved: {text} minutes.")
         return
 
     if action == "admin_separate_poster":
         target = normalize(text)
-        matched = next((
-            item for item in anime
-            if target in {
-                normalize(item["button_name"]),
-                normalize(item["search_name"]),
-            }
-        ), None)
+        matched = next((item for item in anime if target == normalize(item["button_name"]) or target in aliases_for(item["search_name"])), None)
         if not matched:
-            await message.reply_text("❌ Anime not found in your list. Send the exact anime title from /list.")
+            await reply_bold(message, "❌ Anime not found in your list. Send the exact anime title from /list.")
             return
         context.user_data["separate_poster_key"] = normalize(matched["search_name"])
         context.user_data["separate_poster_title"] = matched["button_name"]
         context.user_data["admin_action"] = "admin_separate_poster_photo"
         mark_as_admin_input(context, message)
-        await message.reply_text(f"Now send the photo for {matched['button_name']}.")
+        await reply_bold(message, f"Now send the photo for {matched['button_name']}.")
+        return
+
+    if action == "admin_verify_text":
+        if not text:
+            await reply_bold(message, "Verification message cannot be empty.")
+            return
+        settings["verify_post_text"] = text
+        save_settings()
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        await reply_bold(message, "✅ Verification post message updated.")
+        return
+
+    if action == "admin_verify_button_text":
+        if not text or len(text) > 64:
+            await reply_bold(message, "Button text must contain 1 to 64 characters.")
+            return
+        settings["verify_button_text"] = text
+        save_settings()
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        await reply_bold(message, "✅ Verification button text updated. It remains green.")
         return
 
 
 async def process_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
-
-    if not message or not message.photo or not user:
+    if not message or not message.photo or not user or not is_admin(user.id):
         return
 
-    # Group poster collection takes priority over the existing private admin
-    # poster tools. The caption is intentionally ignored.
-    if message.chat.type in ("group", "supergroup"):
-        session = context.chat_data.get("poster_collection")
-        if session and session.get("user_id") == user.id:
-            if not await is_group_admin(context.bot, message.chat_id, user.id):
-                return
-
-            items = session.get("items", [])
-            index = int(session.get("index", 0))
-            if index >= len(items):
-                context.chat_data.pop("poster_collection", None)
-                return
-
-            item = items[index]
-            poster_key = item["poster_key"]
-            settings.setdefault("posters", {})[poster_key] = message.photo[-1].file_id
-            save_settings()
-            session["index"] = index + 1
-            await send_next_poster_title(message, context)
+    # Caption-based workflow: each image must carry its own exact anime title.
+    if context.user_data.get("poster_caption_mode"):
+        caption = (message.caption or "").strip()
+        if not caption:
+            await reply_bold(message, "❌ Add the exact saved anime title in this photo's caption.")
             return
-
-    # The remaining poster-setting actions are reserved for configured bot admins.
-    if not is_admin(user.id):
+        target = normalize(caption)
+        matched = next((item for item in load_anime() if target == normalize(item["button_name"]) or target in aliases_for(item["search_name"])), None)
+        if not matched:
+            await reply_bold(message, "❌ No exact saved anime matched this caption. Poster was not saved.")
+            return
+        key = normalize(matched["search_name"])
+        posters = settings.setdefault("posters", {})
+        if posters.get(key):
+            await reply_bold(message, f"⚠️ A poster is already saved for {matched['button_name']}. It was not overwritten.")
+            return
+        posters[key] = message.photo[-1].file_id
+        save_settings()
+        await reply_bold(message, f"✅ Poster saved for {matched['button_name']}.")
         return
 
     action = context.user_data.get("admin_action")
-
     if action == "admin_global_poster":
         settings["global_poster"] = message.photo[-1].file_id
         settings["poster_mode"] = "global"
         save_settings()
         context.user_data.pop("admin_action", None)
-        await message.reply_text("✅ Global poster updated.")
+        await reply_bold(message, "✅ Global poster updated.")
         return
 
     if action == "admin_separate_poster_photo":
@@ -1087,77 +1655,95 @@ async def process_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         title = context.user_data.get("separate_poster_title", "anime")
         if not poster_key:
             context.user_data.pop("admin_action", None)
-            await message.reply_text("❌ Could not identify the anime. Please start again from Poster Settings.")
+            await reply_bold(message, "❌ Could not identify the anime. Please start again from Poster Settings.")
             return
         settings.setdefault("posters", {})[poster_key] = message.photo[-1].file_id
         save_settings()
         context.user_data.pop("admin_action", None)
         context.user_data.pop("separate_poster_key", None)
         context.user_data.pop("separate_poster_title", None)
-        await message.reply_text(f"✅ Separate poster saved for {title}.")
+        await reply_bold(message, f"✅ Separate poster saved for {title}.")
+        return
+
+    if action == "admin_verify_photo":
+        settings["verify_post_photo"] = message.photo[-1].file_id
+        save_settings()
+        context.user_data.pop("admin_action", None)
+        await reply_bold(message, "✅ Verification post photo saved.")
         return
 
     if action == "admin_random_poster":
         collection = context.user_data.setdefault("random_poster_collection", [])
         if len(collection) >= 20:
             await message.reply_text(
-                "⚠️ You already sent 20 posters. Tap ✅ Done to save this collection.",
+                bold_text("⚠️ You already sent 20 posters. Tap Done to save this collection."),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Done", callback_data="random_poster_done")],
-                    [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel")],
+                    [InlineKeyboardButton("✅ Done", callback_data="random_poster_done", style="success")],
+                    [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel", style="danger")],
                 ]),
             )
             return
-
         collection.append(message.photo[-1].file_id)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Done", callback_data="random_poster_done")],
-            [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel")],
-        ])
         await message.reply_text(
-            f"✅ Poster received ({len(collection)}/20). Send another photo or tap ✅ Done.",
-            reply_markup=keyboard,
+            bold_text(f"✅ Poster received ({len(collection)}/20). Send another or tap Done."),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Done", callback_data="random_poster_done", style="success")],
+                [InlineKeyboardButton("❎ Cancel", callback_data="random_poster_cancel", style="danger")],
+            ]),
         )
 
 
 async def process_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
-
-    if not message or not message.document or not user:
-        return
-    if not is_admin(user.id):
+    if not message or not message.document or not user or not is_admin(user.id):
         return
     if context.user_data.get("admin_action") != "admin_import":
         return
-
     document = message.document
     if not document.file_name or not document.file_name.lower().endswith(".txt"):
-        await message.reply_text("Please upload a .txt file.")
+        await reply_bold(message, "Please upload a .txt file.")
         return
-
     file = await context.bot.get_file(document.file_id)
     content = await file.download_as_bytearray()
     imported_text = content.decode("utf-8", errors="replace")
     anime = load_anime()
-    added = 0
-
+    added_titles = []
     for line in imported_text.splitlines():
         entry = parse_anime_entry(line)
         if not entry:
             continue
-        if any(normalize(item["search_name"]) == normalize(entry["search_name"]) for item in anime):
+        existing_aliases = {alias for item in anime for alias in aliases_for(item["search_name"])}
+        if any(alias in existing_aliases for alias in aliases_for(entry["search_name"])):
             continue
         anime.append(entry)
-        added += 1
-
+        added_titles.append(entry["button_name"])
     save_anime(anime)
     context.user_data.pop("admin_action", None)
-    await message.reply_text(f"✅ Imported {added} anime entry/entries.")
-
+    await reply_bold(message, f"✅ Imported {len(added_titles)} new anime entr(y/ies).")
+    if added_titles:
+        await notify_new_anime(context, added_titles)
 
 # =========================
-# START BOT
+# POST-STARTUP RESTORE
+# =========================
+
+async def post_init(application: Application):
+    """Restore active expiry timers after a Render restart."""
+    if application.job_queue:
+        for user_id, raw_expiry in settings.get("user_access", {}).items():
+            try:
+                expiry = float(raw_expiry)
+                uid = int(user_id)
+            except (TypeError, ValueError):
+                continue
+            schedule_expiry_job(application, uid, expiry)
+        for record in list(settings.get("pending_list_deletions", [])):
+            if isinstance(record, dict) and record.get("message_ids"):
+                schedule_list_deletion(application, record)
+
+# =========================
+# APPLICATION ENTRY POINT
 # =========================
 
 def main():
@@ -1165,30 +1751,31 @@ def main():
         raise RuntimeError("BOT_TOKEN is missing. Add it in Render Environment Variables.")
 
     threading.Thread(target=run_web_server, daemon=True).start()
-
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .defaults(Defaults(parse_mode=ParseMode.HTML))
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", show_list))
     application.add_handler(CommandHandler("trending", trending))
     application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("addposters", add_posters))
-    application.add_handler(CommandHandler("skipposter", skip_poster))
-    application.add_handler(CommandHandler("cancelposters", cancel_posters))
+    application.add_handler(CommandHandler("verifylinks", verifylinks_command))
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("addposters", addposters_command))
+    application.add_handler(CommandHandler("cancelposters", cancelposters_command))
 
-    application.add_handler(CallbackQueryHandler(admin_buttons))
+    application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|default_color:|anime_color:|random_poster_|verify_link_)"))
+    application.add_handler(CallbackQueryHandler(bot_callback, pattern=r"^(suggest:|request:)"))
 
-    # Admin media handlers run before the general text-search handler.
-    application.add_handler(MessageHandler(filters.PHOTO, process_admin_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, process_admin_document))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_text),
-        group=0,
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, search_anime),
-        group=1,
-    )
+    application.add_handler(MessageHandler(filters.PHOTO, process_admin_photo), group=0)
+    application.add_handler(MessageHandler(filters.Document.ALL, process_admin_document), group=0)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_text), group=0)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_anime), group=1)
 
     logger.info("Starting ANIFLIX ANIME INDEX BOT TAMIL")
     application.run_polling(drop_pending_updates=False)
