@@ -9,10 +9,12 @@ import secrets
 import shutil
 import threading
 import time
+import unicodedata
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify
@@ -127,11 +129,14 @@ def migrate_legacy_data_files():
                     merged["registered_users"] = list(dict.fromkeys(
                         list(old_data.get("registered_users", [])) + list(new_data.get("registered_users", []))
                     ))
-                    for key in ("random_posters", "pending_requests", "pending_list_deletions"):
+                    for key in ("random_posters", "pending_requests", "pending_list_deletions", "movie_posts", "registered_groups", "poster_exclusions"):
                         values = []
                         seen_values = set()
                         for item in list(old_data.get(key, []) or []) + list(new_data.get(key, []) or []):
-                            marker = item.get("id") if isinstance(item, dict) else json.dumps(item, sort_keys=True, ensure_ascii=False)
+                            marker = (
+                                item.get("id") if isinstance(item, dict) and item.get("id") is not None
+                                else json.dumps(item, sort_keys=True, ensure_ascii=False)
+                            )
                             if marker not in seen_values:
                                 values.append(item)
                                 seen_values.add(marker)
@@ -210,13 +215,17 @@ DEFAULT_SETTINGS = {
     "poster_mode": "global",
     "random_posters": [],
     "posters": {},
+    "poster_exclusions": [],
     "search_counts": {},
     "default_button_color": "green",
     "anime_button_colors": {},
     "registered_users": [],
+    "registered_groups": [],
+    "movie_posts": [],
     "verification_enabled": False,
     "verification_links": {},
     "latest_verification_token": "",
+    "custom_verification_url": "",
     "user_access": {},
     "verify_post_text": (
         "🍥 ANIFLIX ANIME INDEX BOT TAMIL\n\n"
@@ -249,10 +258,13 @@ def load_settings():
 
             expected_types = {
                 "posters": dict,
+                "poster_exclusions": list,
                 "random_posters": list,
                 "search_counts": dict,
                 "anime_button_colors": dict,
                 "registered_users": list,
+                "registered_groups": list,
+                "movie_posts": list,
                 "verification_links": dict,
                 "user_access": dict,
                 "request_dedupe": dict,
@@ -262,6 +274,9 @@ def load_settings():
             for key, expected in expected_types.items():
                 if not isinstance(data.get(key), expected):
                     data[key] = deepcopy(DEFAULT_SETTINGS[key])
+
+            if not isinstance(data.get("custom_verification_url"), str):
+                data["custom_verification_url"] = ""
 
             if data.get("poster_mode") not in {"global", "random"}:
                 data["poster_mode"] = "global"
@@ -291,6 +306,13 @@ def save_settings():
 def normalize(value):
     value = str(value or "").lower().strip()
     value = re.sub(r"[^a-z0-9\s]", " ", value)
+    return " ".join(value.split())
+
+
+def normalize_movie_title(value):
+    """Normalize movie titles while retaining Tamil, Japanese, and other scripts."""
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    value = "".join(char if char.isalnum() else " " for char in value)
     return " ".join(value.split())
 
 
@@ -384,6 +406,18 @@ def register_private_user(user):
         save_settings()
 
 
+def register_group_chat(chat):
+    """Remember groups/channels where Telegram delivers updates to this bot."""
+    if not chat or chat.type not in {"group", "supergroup", "channel"}:
+        return
+    groups = settings.setdefault("registered_groups", [])
+    group_id = int(chat.id)
+    known = {int(value) for value in groups if str(value).lstrip("-").isdigit()}
+    if group_id not in known:
+        groups.append(group_id)
+        save_settings()
+
+
 def private_access_is_valid(user_id):
     if not settings.get("verification_enabled", False):
         return True
@@ -443,11 +477,14 @@ async def send_verification_post(message, context, expired=False):
     if expired:
         text = "⏰ ACCESS EXPIRED\n\nYour 6-hour access to ANIFLIX Anime Index Bot has expired. Open the verification link below to activate another 6-hour session.\n\n" + text
 
-    token = verification_keyboard()
     markup = None
-    if token:
-        me = await context.bot.get_me()
-        link = f"https://t.me/{me.username}?start=verify_{token}"
+    link = settings.get("custom_verification_url", "").strip()
+    if not link:
+        token = verification_keyboard()
+        if token:
+            me = await context.bot.get_me()
+            link = f"https://t.me/{me.username}?start=verify_{token}"
+    if link:
         label = settings.get("verify_button_text") or "🟢 VERIFY NOW"
         markup = InlineKeyboardMarkup([[
             InlineKeyboardButton(label, url=link, style="success")
@@ -554,6 +591,38 @@ def find_exact_match(query):
     return None
 
 
+def find_movie_match(query):
+    """Exact title lookup for saved original movie / web-series posts."""
+    key = normalize_movie_title(query)
+    if not key:
+        return None
+    for item in settings.get("movie_posts", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("normalized_title") == key or normalize_movie_title(item.get("title", "")) == key:
+            return item
+    return None
+
+
+async def send_movie_result(update: Update, item, context: ContextTypes.DEFAULT_TYPE):
+    """Copy the stored Telegram post so its media, caption entities and links stay intact."""
+    message = update.effective_message
+    if not message:
+        return
+    try:
+        await context.bot.copy_message(
+            chat_id=message.chat_id,
+            from_chat_id=int(item["source_chat_id"]),
+            message_id=int(item["source_message_id"]),
+        )
+    except Exception:
+        logger.exception("Could not copy saved movie post %r", item.get("title"))
+        await reply_bold(
+            message,
+            "❌ This saved movie post could not be delivered. Please contact the admin.",
+        )
+
+
 def similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
@@ -624,11 +693,15 @@ async def send_anime_result(update, item, context):
         )
     ]])
 
-    poster = settings.get("posters", {}).get(normalize(item["search_name"]), "")
+    poster_key = normalize(item["search_name"])
+    poster_excluded = poster_key in {
+        normalize(value) for value in settings.get("poster_exclusions", [])
+    }
+    poster = "" if poster_excluded else settings.get("posters", {}).get(poster_key, "")
     random_posters = settings.get("random_posters", [])
-    if not poster and settings.get("poster_mode", "global") == "random" and random_posters:
+    if not poster_excluded and not poster and settings.get("poster_mode", "global") == "random" and random_posters:
         poster = random.choice(random_posters)
-    if not poster:
+    if not poster_excluded and not poster:
         poster = settings.get("global_poster", "")
 
     message = update.effective_message
@@ -671,6 +744,7 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not message or not message.text or not user or not chat:
         return
+    register_group_chat(chat)
     if message.text.startswith("/"):
         return
     if context.user_data.get("skip_search_message_id") == message.message_id:
@@ -689,6 +763,11 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exact = find_exact_match(query)
     if exact:
         await send_anime_result(update, exact, context)
+        return
+
+    movie = find_movie_match(query)
+    if movie:
+        await send_movie_result(update, movie, context)
         return
 
     # Only short, title-like queries enter the request/suggestion path.
@@ -760,10 +839,13 @@ async def verification_expired_job(context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
         )
         # Attach the current configured verification post/button when possible.
-        token = verification_keyboard()
-        if token:
-            me = await context.bot.get_me()
-            url = f"https://t.me/{me.username}?start=verify_{token}"
+        url = settings.get("custom_verification_url", "").strip()
+        if not url:
+            token = verification_keyboard()
+            if token:
+                me = await context.bot.get_me()
+                url = f"https://t.me/{me.username}?start=verify_{token}"
+        if url:
             await send_bold(
                 context.bot,
                 user_id,
@@ -901,6 +983,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not message or not user or not chat:
         return
+    register_group_chat(chat)
     if chat.type == "private":
         register_private_user(user)
         if is_admin(user.id):
@@ -1113,6 +1196,62 @@ async def addposters_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def removeposters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not is_admin(user.id):
+        await reply_bold(message, "You are not authorized to remove posters.")
+        return
+    context.user_data.pop("poster_caption_mode", None)
+    context.user_data["admin_action"] = "admin_remove_poster"
+    await reply_bold(
+        message,
+        "🗑 REMOVE ONE ANIME POSTER\n\nSend the exact saved anime title or Search Name. Only that anime's separate poster will be removed. Its title, download link, and anime entry will remain saved.",
+    )
+
+
+async def removeallposters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not is_admin(user.id):
+        await reply_bold(message, "You are not authorized to remove posters.")
+        return
+    per_anime = len(settings.get("posters", {}))
+    random_count = len(settings.get("random_posters", []))
+    had_global = bool(settings.get("global_poster"))
+    settings["posters"] = {}
+    settings["poster_exclusions"] = []
+    settings["random_posters"] = []
+    settings["global_poster"] = ""
+    settings["poster_mode"] = "global"
+    save_settings()
+    context.user_data.pop("poster_caption_mode", None)
+    context.user_data.pop("admin_action", None)
+    await reply_bold(
+        message,
+        "✅ ALL SAVED POSTERS REMOVED\n\n"
+        f"Separate posters: {per_anime}\nRandom posters: {random_count}\nGlobal poster: {'1' if had_global else '0'}\n\n"
+        "Anime titles, saved download links, and movie posts were not changed.",
+    )
+
+
+async def editlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not is_admin(user.id):
+        await reply_bold(message, "You are not authorized to replace the anime list.")
+        return
+    context.user_data.pop("poster_caption_mode", None)
+    context.user_data["admin_action"] = "admin_edit_list"
+    await reply_bold(
+        message,
+        "📄 REPLACE THE ANIME LIST\n\n"
+        "Send the complete new list as text, one anime entry per line, in this format:\n"
+        "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n\n"
+        "The current list will be replaced only after at least one valid entry is received. An empty or incorrectly formatted list will not change your saved data. You may also upload a .txt file in this format.",
+    )
+
+
 async def cancelposters_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_admin(update.effective_user.id):
         await reply_bold(update.effective_message, "You are not authorized.")
@@ -1130,11 +1269,13 @@ def main_admin_keyboard():
     verification_label = "🔐 Verification: ON" if settings.get("verification_enabled") else "🔐 Verification: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Anime", callback_data="admin_add", style="success"), InlineKeyboardButton("➖ Remove Anime", callback_data="admin_remove", style="danger")],
+        [InlineKeyboardButton("🎬 Add Movies", callback_data="admin_add_movies", style="success")],
         [InlineKeyboardButton("📄 Import TXT", callback_data="admin_import"), InlineKeyboardButton("📚 View List", callback_data="admin_list")],
         [InlineKeyboardButton("🖼 Poster Settings", callback_data="admin_poster_settings"), InlineKeyboardButton("📝 Post Text", callback_data="admin_post_text")],
         [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_welcome_text"), InlineKeyboardButton("❌ No Anime Message", callback_data="admin_no_anime_text")],
         [InlineKeyboardButton("🎨 Button Colour", callback_data="admin_button_colors")],
-        [InlineKeyboardButton("🔗 Verify Link", callback_data="admin_verify_link"), InlineKeyboardButton("📝 Verify Post", callback_data="admin_verify_post")],
+        [InlineKeyboardButton("🔗 Verify Link", callback_data="admin_verify_link"), InlineKeyboardButton("🔗 Set Verify Link", callback_data="admin_set_verify_link")],
+        [InlineKeyboardButton("📝 Verify Post", callback_data="admin_verify_post")],
         [InlineKeyboardButton(verification_label, callback_data="admin_verify_toggle", style="success" if settings.get("verification_enabled") else "danger")],
         [InlineKeyboardButton("⏱ Set Expiry", callback_data="admin_expiry")],
     ])
@@ -1185,6 +1326,65 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     action = query.data or ""
 
+    if action in {"movie_post_save", "movie_post_edit", "movie_post_cancel"}:
+        pending = context.user_data.get("pending_movie_post")
+        if not pending:
+            await query.message.reply_text(bold_text("This movie-post action has expired. Open Add Movies and send the post again."))
+            return
+        if action == "movie_post_cancel":
+            context.user_data.pop("pending_movie_post", None)
+            context.user_data.pop("admin_action", None)
+            await query.message.reply_text(bold_text("❎ Movie post was not saved."))
+            return
+        if action == "movie_post_edit":
+            context.user_data["admin_action"] = "admin_movie_title_edit"
+            await query.message.reply_text(bold_text("Send the correct movie / web-series title. The post itself will remain unchanged."))
+            return
+
+        title = str(pending.get("title", "")).strip()
+        title_key = normalize_movie_title(title)
+        if not title_key:
+            await query.message.reply_text(bold_text("❌ The title is empty. Tap Edit Title and send the correct title."))
+            return
+        duplicate = next((
+            x for x in settings.get("movie_posts", [])
+            if isinstance(x, dict) and normalize_movie_title(x.get("title", "")) == title_key
+        ), None)
+        if duplicate:
+            await query.message.reply_text(bold_text(f"⚠️ A post for '{title}' is already saved. The existing post was not overwritten."))
+            context.user_data.pop("pending_movie_post", None)
+            context.user_data.pop("admin_action", None)
+            return
+
+        # Create a bot-owned copy in the admin's private chat. Later lookups copy
+        # this saved message verbatim, preserving the original caption entities
+        # and clickable link text rather than rebuilding the post from plain text.
+        try:
+            saved_message = await context.bot.copy_message(
+                chat_id=int(user.id),
+                from_chat_id=int(pending["source_chat_id"]),
+                message_id=int(pending["source_message_id"]),
+            )
+        except Exception:
+            logger.exception("Could not preserve the original movie post for %s", title)
+            await query.message.reply_text(bold_text("❌ I could not save a copy of that post. Please send it to the bot again, making sure it is not protected from copying."))
+            return
+
+        record = {
+            "title": title,
+            "normalized_title": title_key,
+            "source_chat_id": int(user.id),
+            "source_message_id": int(saved_message.message_id),
+            "created_at": time.time(),
+        }
+        settings.setdefault("movie_posts", []).append(record)
+        save_settings()
+        context.user_data.pop("pending_movie_post", None)
+        context.user_data.pop("admin_action", None)
+        await query.message.reply_text(bold_text(f"✅ Saved original post for: {title}\n\nUsers can now search this exact title."))
+        await notify_new_content(context, [title], "movie / web-series")
+        return
+
     # Avoid leaving caption-based poster mode active while editing unrelated
     # admin settings (for example, the verification photo).
     poster_actions = {
@@ -1224,6 +1424,21 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✅ YES, GENERATE", callback_data="verify_link_yes", style="success"),
                 InlineKeyboardButton("❌ NO", callback_data="verify_link_no", style="danger"),
             ]]),
+        )
+        return
+
+    if action == "admin_set_verify_link":
+        context.user_data["admin_action"] = "admin_set_verify_link"
+        current = settings.get("custom_verification_url", "").strip()
+        status = f"\n\nCurrent link: {current}" if current else "\n\nNo custom link is set. The built-in bot verification link is currently used."
+        await query.message.reply_text(
+            bold_text(
+                "🔗 SET PM VERIFICATION LINK\n\n"
+                "Send the HTTPS verification URL to use on the VERIFY NOW button. "
+                "To clear the custom URL and return to the built-in bot verification link, send: clear"
+                + status
+                + "\n\nFor automatic 6-hour access activation, the URL must be a bot verification deep link generated by /verifylinks, or your external verification service must redirect users back to that link."
+            )
         )
         return
 
@@ -1279,11 +1494,14 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "admin_verify_preview":
         text = settings.get("verify_post_text", DEFAULT_SETTINGS["verify_post_text"])
-        token = verification_keyboard()
         markup = None
-        if token:
-            me = await context.bot.get_me()
-            link = f"https://t.me/{me.username}?start=verify_{token}"
+        link = settings.get("custom_verification_url", "").strip()
+        if not link:
+            token = verification_keyboard()
+            if token:
+                me = await context.bot.get_me()
+                link = f"https://t.me/{me.username}?start=verify_{token}"
+        if link:
             markup = InlineKeyboardMarkup([[
                 InlineKeyboardButton(settings.get("verify_button_text", "🟢 VERIFY NOW"), url=link, style="success")
             ]])
@@ -1342,6 +1560,19 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
         ])
         await query.message.reply_text(bold_text("🖼 POSTER SETTINGS\n\nChoose poster mode:"), reply_markup=keyboard)
+        return
+
+    if action == "admin_add_movies":
+        context.user_data.pop("pending_movie_post", None)
+        context.user_data["admin_action"] = "admin_add_movie_post"
+        await query.message.reply_text(
+            bold_text(
+                "🎬 ADD MOVIE / WEB SERIES POST\n\n"
+                "Send the complete Telegram post (photo, video, document, or text) here. "
+                "I will detect the title from the first meaningful title line and ask you to confirm it before saving.\n\n"
+                "The saved post is copied as-is, so its caption formatting, embedded URLs, and clickable link text are preserved."
+            )
+        )
         return
 
     if action == "admin_addposters":
@@ -1455,34 +1686,133 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADMIN MESSAGE / MEDIA PROCESSORS
 # =========================
 
-async def notify_new_anime(context, titles):
+async def notify_new_content(context, titles, content_type="anime"):
     if not titles:
         return
     users = sorted({int(uid) for uid in settings.get("registered_users", []) if str(uid).isdigit()})
-    if not users:
+    groups = sorted({int(gid) for gid in settings.get("registered_groups", []) if str(gid).lstrip("-").isdigit()})
+    targets = [("private", uid) for uid in users] + [("group", gid) for gid in groups]
+    if not targets:
         return
-    lines = ["🆕 NEW ANIME ADDED 👇", ""]
-    lines.extend(f"• {title}" for title in titles)
-    lines.extend(["", "📋 Copy the anime title and paste it here to get the anime.", "", "Powered By: @ANIFLIXANIMETAMIL"])
+    normalized_kind = str(content_type or "anime").strip().lower()
+    header = "🆕 NEW MOVIE / WEB SERIES ADDED 👇" if "movie" in normalized_kind else "🆕 NEW ANIME ADDED 👇"
+    footer = "📋 Copy the title and paste it here to get the post." if "movie" in normalized_kind else "📋 Copy the anime title and paste it here to get the anime."
     # Keep each Telegram message below the 4096-character message limit.
     chunks = []
-    current = "🆕 NEW ANIME ADDED 👇\n\n"
+    current = header + "\n\n"
     for title in titles:
         line = f"• {title}\n"
         if len(current) + len(line) > 3300:
             chunks.append(current.rstrip())
-            current = "🆕 NEW ANIME ADDED 👇\n\n"
+            current = header + "\n\n"
         current += line
-    current += "\n📋 Copy the anime title and paste it here to get the anime.\n\nPowered By: @ANIFLIXANIMETAMIL"
+    current += f"\n{footer}\n\nPowered By: @ANIFLIXANIMETAMIL"
     chunks.append(current)
-    for uid in users:
+    for target_type, target_id in targets:
         for chunk in chunks:
             try:
-                await send_bold(context.bot, uid, chunk)
+                await send_bold(context.bot, target_id, chunk)
             except Exception:
-                logger.info("Could not send new-anime notification to user %s", uid, exc_info=True)
+                logger.info("Could not send new-%s notification to %s %s", normalized_kind, target_type, target_id, exc_info=True)
                 break
         await asyncio.sleep(0.03)
+
+
+async def notify_new_anime(context, titles):
+    """Compatibility wrapper used by the existing anime add/import workflows."""
+    await notify_new_content(context, titles, "anime")
+
+
+def detect_movie_title_from_post(message):
+    """Read a likely title from the post without changing its original content."""
+    raw = message.text or message.caption or ""
+    if not raw:
+        return ""
+
+    ignored_prefixes = (
+        "genre", "genres", "audio", "quality", "download", "how to open",
+        "how to download", "how to watch",
+        "cast", "director", "rating", "imdb", "language", "runtime",
+        "release date", "story", "description", "size", "uploaded",
+        "season", "episode", "available in", "movie details",
+    )
+    for raw_line in raw.splitlines()[:10]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        # If a pasted post contains Markdown link syntax, use only its visible
+        # text for detection. The original Telegram message is never rewritten.
+        line = re.sub(r"\[([^\]]+)\]\((?:https?://)[^)]+\)", r"\1", line)
+        line = re.sub(r"^(?:title|movie|movie name|web series|series name|anime name)\s*[:：\-]\s*", "", line, flags=re.IGNORECASE)
+        line = line.strip()
+
+        # Drop leading emoji / decorative punctuation, e.g. "⭐ Scene (2026)".
+        while line and not line[0].isalnum():
+            line = line[1:]
+        line = line.strip("*_`~ ")
+        # Drop trailing decorative symbols but preserve title punctuation such
+        # as the closing bracket in "Scene (2026)".
+        while line and unicodedata.category(line[-1]).startswith("S"):
+            line = line[:-1].rstrip()
+        line = re.sub(r"\s+", " ", line).strip(" \t|—–-:：")
+        if not line:
+            continue
+        key = normalize(line)
+        if any(key.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        if len(line) > 120 or sum(1 for char in line if char.isalpha()) < 2:
+            continue
+        if re.fullmatch(r"https?://\S+", line, flags=re.IGNORECASE):
+            continue
+        return line
+    return ""
+
+
+async def process_admin_movie_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Capture one admin-sent post, detect its title, and ask for confirmation."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not is_admin(user.id):
+        return
+    if context.user_data.get("admin_action") != "admin_add_movie_post":
+        return
+    if message.chat.type != "private":
+        await reply_bold(message, "Please send movie posts to the bot in its private chat so I can keep a saved original copy for future searches.")
+        return
+    if message.text and message.text.startswith("/"):
+        return
+
+    title = detect_movie_title_from_post(message)
+    if not title:
+        await reply_bold(
+            message,
+            "❌ I could not confidently detect the title. Please send the post again with the movie / series title on its own first meaningful line, or cancel from the admin panel.",
+        )
+        return
+
+    context.user_data.pop("admin_action", None)
+    context.user_data["pending_movie_post"] = {
+        "title": title,
+        "source_chat_id": int(message.chat_id),
+        "source_message_id": int(message.message_id),
+    }
+    mark_as_admin_input(context, message)
+    await message.reply_text(
+        bold_text(
+            f"🔎 DETECTED TITLE\n\n{title}\n\n"
+            "Check the title carefully. Confirm to save the original post, or edit the title before saving."
+        ),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm & Save", callback_data="movie_post_save", style="success")],
+            [InlineKeyboardButton("✏️ Edit Title", callback_data="movie_post_edit", style="primary")],
+            [InlineKeyboardButton("❎ Cancel", callback_data="movie_post_cancel", style="danger")],
+        ]),
+    )
+
+
+async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remember any group where Telegram delivers an update to this bot."""
+    register_group_chat(update.effective_chat)
 
 
 async def process_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1495,6 +1825,108 @@ async def process_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     text = message.text.strip()
     anime = load_anime()
+
+    if action == "admin_remove_poster":
+        target = normalize(text)
+        matched = next(
+            (item for item in anime if target == normalize(item["button_name"]) or target in aliases_for(item["search_name"])),
+            None,
+        )
+        if not matched:
+            await reply_bold(message, "❌ Anime not found. Send the exact saved title or Search Name from /list.")
+            return
+        key = normalize(matched["search_name"])
+        poster = settings.setdefault("posters", {}).pop(key, None)
+        exclusions = settings.setdefault("poster_exclusions", [])
+        if key not in {normalize(value) for value in exclusions}:
+            exclusions.append(key)
+        save_settings()
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        if poster:
+            await reply_bold(message, f"✅ Separate poster removed for {matched['button_name']}. Its title and download link are unchanged.")
+        else:
+            await reply_bold(message, f"ℹ️ No separate poster was saved for {matched['button_name']}. Nothing else was changed.")
+        return
+
+    if action == "admin_set_verify_link":
+        if text.lower() in {"clear", "none", "off", "remove"}:
+            settings["custom_verification_url"] = ""
+            save_settings()
+            context.user_data.pop("admin_action", None)
+            mark_as_admin_input(context, message)
+            await reply_bold(message, "✅ Custom verification link cleared. The built-in bot verification link will be used again.")
+            return
+        parsed = urlparse(text)
+        if parsed.scheme != "https" or not parsed.netloc:
+            await reply_bold(message, "❌ Send a valid HTTPS URL, or send 'clear' to use the built-in verification link.")
+            return
+        settings["custom_verification_url"] = text
+        save_settings()
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        await reply_bold(
+            message,
+            "✅ Custom PM verification link saved. It will appear on the VERIFY NOW button whenever PM verification is ON. For automatic 6-hour access, the link must be a /verifylinks deep link or return users to one after external verification.",
+        )
+        return
+
+    if action == "admin_movie_title_edit":
+        pending = context.user_data.get("pending_movie_post")
+        title = re.sub(r"\s+", " ", text).strip()
+        if not pending:
+            context.user_data.pop("admin_action", None)
+            await reply_bold(message, "❌ The pending post has expired. Open Add Movies and send it again.")
+            return
+        if not title or len(title) > 120 or not any(char.isalpha() for char in title):
+            await reply_bold(message, "Send a valid movie / web-series title (1–120 characters).")
+            return
+        pending["title"] = title
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        await message.reply_text(
+            bold_text(f"🔎 TITLE TO SAVE\n\n{title}\n\nConfirm this title to save the original post."),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm & Save", callback_data="movie_post_save", style="success")],
+                [InlineKeyboardButton("✏️ Edit Title", callback_data="movie_post_edit", style="primary")],
+                [InlineKeyboardButton("❎ Cancel", callback_data="movie_post_cancel", style="danger")],
+            ]),
+        )
+        return
+
+    if action == "admin_edit_list":
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        replacement = []
+        seen_names = set()
+        invalid_lines = []
+        for line_number, line in enumerate(lines, start=1):
+            entry = parse_anime_entry(line)
+            if not entry:
+                invalid_lines.append(line_number)
+                continue
+            key = normalize(entry["search_name"])
+            if key and key not in seen_names:
+                replacement.append(entry)
+                seen_names.add(key)
+        if not replacement or invalid_lines:
+            bad = ", ".join(str(number) for number in invalid_lines[:15])
+            details = f"\nInvalid line(s): {bad}" if bad else ""
+            await reply_bold(
+                message,
+                "❌ The new list was not saved. Every non-empty line must use this format:\n"
+                "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n"
+                f"Valid entries detected: {len(replacement)}.{details}\n\nYour existing list is unchanged.",
+            )
+            return
+        old_names = {normalize(item["search_name"]) for item in anime}
+        save_anime(replacement)
+        context.user_data.pop("admin_action", None)
+        mark_as_admin_input(context, message)
+        newly_added = [item["button_name"] for item in replacement if normalize(item["search_name"]) not in old_names]
+        await reply_bold(message, f"✅ Anime list replaced successfully.\nSaved entries: {len(replacement)}\nNew titles: {len(newly_added)}")
+        if newly_added:
+            await notify_new_anime(context, newly_added)
+        return
 
     if action == "admin_add":
         added_titles = []
@@ -1637,6 +2069,7 @@ async def process_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
             await reply_bold(message, f"⚠️ A poster is already saved for {matched['button_name']}. It was not overwritten.")
             return
         posters[key] = message.photo[-1].file_id
+        settings["poster_exclusions"] = [value for value in settings.get("poster_exclusions", []) if normalize(value) != key]
         save_settings()
         await reply_bold(message, f"✅ Poster saved for {matched['button_name']}.")
         return
@@ -1658,6 +2091,7 @@ async def process_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
             await reply_bold(message, "❌ Could not identify the anime. Please start again from Poster Settings.")
             return
         settings.setdefault("posters", {})[poster_key] = message.photo[-1].file_id
+        settings["poster_exclusions"] = [value for value in settings.get("poster_exclusions", []) if normalize(value) != poster_key]
         save_settings()
         context.user_data.pop("admin_action", None)
         context.user_data.pop("separate_poster_key", None)
@@ -1698,7 +2132,8 @@ async def process_admin_document(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     if not message or not message.document or not user or not is_admin(user.id):
         return
-    if context.user_data.get("admin_action") != "admin_import":
+    action = context.user_data.get("admin_action")
+    if action not in {"admin_import", "admin_edit_list"}:
         return
     document = message.document
     if not document.file_name or not document.file_name.lower().endswith(".txt"):
@@ -1708,6 +2143,40 @@ async def process_admin_document(update: Update, context: ContextTypes.DEFAULT_T
     content = await file.download_as_bytearray()
     imported_text = content.decode("utf-8", errors="replace")
     anime = load_anime()
+
+    if action == "admin_edit_list":
+        lines = [line.strip() for line in imported_text.splitlines() if line.strip()]
+        replacement = []
+        seen_names = set()
+        invalid_lines = []
+        for line_number, line in enumerate(lines, start=1):
+            entry = parse_anime_entry(line)
+            if not entry:
+                invalid_lines.append(line_number)
+                continue
+            key = normalize(entry["search_name"])
+            if key and key not in seen_names:
+                replacement.append(entry)
+                seen_names.add(key)
+        if not replacement or invalid_lines:
+            bad = ", ".join(str(number) for number in invalid_lines[:15])
+            details = f"\nInvalid line(s): {bad}" if bad else ""
+            await reply_bold(
+                message,
+                "❌ The new list was not saved. Every non-empty line must use:\n"
+                "BUTTON NAME - URL - GENRE - RATING - SEARCH NAME\n"
+                f"Valid entries detected: {len(replacement)}.{details}\n\nYour existing list is unchanged.",
+            )
+            return
+        old_names = {normalize(item["search_name"]) for item in anime}
+        save_anime(replacement)
+        context.user_data.pop("admin_action", None)
+        newly_added = [item["button_name"] for item in replacement if normalize(item["search_name"]) not in old_names]
+        await reply_bold(message, f"✅ Anime list replaced successfully.\nSaved entries: {len(replacement)}\nNew titles: {len(newly_added)}")
+        if newly_added:
+            await notify_new_anime(context, newly_added)
+        return
+
     added_titles = []
     for line in imported_text.splitlines():
         entry = parse_anime_entry(line)
@@ -1768,10 +2237,15 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("addposters", addposters_command))
     application.add_handler(CommandHandler("cancelposters", cancelposters_command))
+    application.add_handler(CommandHandler("removeposters", removeposters_command))
+    application.add_handler(CommandHandler("removeallposters", removeallposters_command))
+    application.add_handler(CommandHandler("editlist", editlist_command))
 
-    application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|default_color:|anime_color:|random_poster_|verify_link_)"))
+    application.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^(admin_|default_color:|anime_color:|random_poster_|verify_link_|movie_post_)"))
     application.add_handler(CallbackQueryHandler(bot_callback, pattern=r"^(suggest:|request:)"))
 
+    application.add_handler(MessageHandler(filters.ALL, track_group_activity), group=-2)
+    application.add_handler(MessageHandler(filters.ALL, process_admin_movie_post), group=-1)
     application.add_handler(MessageHandler(filters.PHOTO, process_admin_photo), group=0)
     application.add_handler(MessageHandler(filters.Document.ALL, process_admin_document), group=0)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_admin_text), group=0)
