@@ -1216,14 +1216,17 @@ async def removeallposters_command(update: Update, context: ContextTypes.DEFAULT
     if not user or not is_admin(user.id):
         await reply_bold(message, "You are not authorized to remove posters.")
         return
+    # Poster-only operation: never call save_anime(), edit DB_FILE, or alter
+    # anime titles, URLs, movie posts, or other catalogue records here.
     per_anime = len(settings.get("posters", {}))
     random_count = len(settings.get("random_posters", []))
     had_global = bool(settings.get("global_poster"))
     settings["posters"] = {}
-    settings["poster_exclusions"] = []
     settings["random_posters"] = []
     settings["global_poster"] = ""
     settings["poster_mode"] = "global"
+    # Keep poster_exclusions untouched; it is per-title display configuration,
+    # not saved anime data and not a stored poster.
     save_settings()
     context.user_data.pop("poster_caption_mode", None)
     context.user_data.pop("admin_action", None)
@@ -1757,6 +1760,9 @@ def detect_movie_title_from_post(message):
         line = re.sub(r"\s+", " ", line).strip(" \t|—–-:：")
         if not line:
             continue
+        # Release years are metadata, not part of the saved searchable title.
+        # Examples: "DC (2026)" -> "DC", "Scene [2026]" -> "Scene".
+        line = re.sub(r"\s*[([{]\s*(?:19|20)\d{2}\s*[)\]}]\s*$", "", line).strip()
         key = normalize(line)
         if any(key.startswith(prefix) for prefix in ignored_prefixes):
             continue
